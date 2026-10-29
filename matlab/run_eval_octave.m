@@ -1,0 +1,220 @@
+function run_eval_octave(pred_dir, gt_dir, output_csv, benchmark_name)
+% RUN_EVAL_OCTAVE Universal Headless Image Metrics Runner (MS-SSIM-M & LD-M)
+% Compatible with GNU Octave (Google Colab / Linux / Windows) and MATLAB.
+
+if nargin < 2
+    error('Usage: run_eval_octave(pred_dir, gt_dir, [output_csv], [benchmark_name])');
+end
+
+if nargin < 3 || isempty(output_csv)
+    output_csv = '';
+end
+
+if nargin < 4 || isempty(benchmark_name)
+    benchmark_name = 'all';
+end
+
+% Setup paths
+cur_dir = fileparts(mfilename('fullpath'));
+addpath(cur_dir);
+addpath(fullfile(cur_dir, 'SIFTflow'));
+addpath(fullfile(cur_dir, 'SIFTflow', 'mexDenseSIFT'));
+addpath(fullfile(cur_dir, 'SIFTflow', 'mexDiscreteFlow'));
+
+% Octave image package load
+if exist('OCTAVE_VERSION', 'builtin')
+    try
+        pkg load image;
+    catch
+        % image package might be auto-loaded
+    end
+    more off;
+end
+
+% Check MEX binaries
+if exist('mexDenseSIFT') ~= 3
+    error('mexDenseSIFT MEX binary not found! Please run compile_mex script first.');
+end
+if exist('mexDiscreteFlow') ~= 3
+    error('mexDiscreteFlow MEX binary not found! Please run compile_mex script first.');
+end
+
+% 30 document IDs from DocUNet / DewarpNet / DocTr paper (Setting 1)
+paper_ids = {'1', '2', '3', '4', '5', '6', '7', '9', '10', '21', ...
+             '22', '23', '24', '27', '30', '31', '32', '36', '38', '40', ...
+             '41', '44', '45', '46', '47', '48', '50', '51', '52', '53'};
+
+% List files in pred_dir
+raw_files = dir(pred_dir);
+img_exts = {'.png', '.jpg', '.jpeg', '.bmp', '.PNG', '.JPG', '.JPEG'};
+pred_list = {};
+
+for k = 1:length(raw_files)
+    if raw_files(k).isdir
+        continue;
+    end
+    [~, ~, ext] = fileparts(raw_files(k).name);
+    if ismember(ext, img_exts)
+        pred_list{end+1} = raw_files(k).name;
+    end
+end
+
+pred_list = sort(pred_list);
+
+% Filter for benchmark
+valid_pairs = {};
+for k = 1:length(pred_list)
+    p_name = pred_list{k};
+    [~, name_no_ext, ~] = fileparts(p_name);
+    parts = strsplit(name_no_ext, '_');
+    doc_id = regexprep(parts{1}, '[^0-9]', '');
+    if isempty(doc_id)
+        doc_id = regexprep(name_no_ext, '[^0-9]', '');
+    end
+
+    if strcmpi(benchmark_name, 'docunet_paper_subset')
+        if ~ismember(doc_id, paper_ids)
+            continue;
+        end
+    end
+
+    % Match GT scan file
+    gt_file = '';
+    scan_name = '';
+    for e = 1:length(img_exts)
+        candidate = fullfile(gt_dir, [doc_id, img_exts{e}]);
+        if exist(candidate, 'file')
+            gt_file = candidate;
+            scan_name = [doc_id, img_exts{e}];
+            break;
+        end
+    end
+    if isempty(gt_file)
+        for e = 1:length(img_exts)
+            candidate = fullfile(gt_dir, [name_no_ext, img_exts{e}]);
+            if exist(candidate, 'file')
+                gt_file = candidate;
+                scan_name = [name_no_ext, img_exts{e}];
+                break;
+            end
+        end
+    end
+
+    if ~isempty(gt_file)
+        valid_pairs{end+1} = struct('pred_name', p_name, ...
+                                    'pred_path', fullfile(pred_dir, p_name), ...
+                                    'scan_name', scan_name, ...
+                                    'scan_path', gt_file);
+    end
+end
+
+num_pairs = length(valid_pairs);
+fprintf('========================================================================================\n');
+fprintf('=== Official MATLAB/Octave Image Evaluation (MS-SSIM-M & LD-M) ===\n');
+fprintf('Benchmark       : %s\n', benchmark_name);
+fprintf('Predictions dir : %s\n', pred_dir);
+fprintf('Ground Truth dir: %s\n', gt_dir);
+fprintf('Total images    : %d\n', num_pairs);
+fprintf('========================================================================================\n');
+fprintf('%-5s | %-25s | %-12s | %-9s | %-8s | %-8s\n', 'STT', 'Dewarped Image', 'Scan GT', 'MS-SSIM-M', 'LD-M', 'Time (s)');
+fprintf('----------------------------------------------------------------------------------------\n');
+
+if num_pairs == 0
+    fprintf('No valid image pairs found.\n');
+    return;
+end
+
+tarea = 598400;
+ms_list = zeros(num_pairs, 1);
+ld_list = zeros(num_pairs, 1);
+time_list = zeros(num_pairs, 1);
+results_cell = cell(num_pairs, 6);
+
+t_all_start = tic;
+
+for i = 1:num_pairs
+    t_img_start = tic;
+    pair = valid_pairs{i};
+
+    A1 = imread(pair.pred_path);
+    ref = imread(pair.scan_path);
+
+    if size(A1, 3) == 3
+        A1 = rgb2gray(A1);
+    end
+    if size(ref, 3) == 3
+        ref = rgb2gray(ref);
+    end
+
+    % Resize scan to benchmark target area
+    b = sqrt(tarea / size(ref, 1) / size(ref, 2));
+    ref = imresize(ref, b);
+
+    % Resize dewarped to match scan
+    A1 = imresize(A1, [size(ref, 1), size(ref, 2)]);
+
+    % Apply background mask: black borders in dewarped image are masked out in GT
+    ref_msk = ref;
+    m1 = (A1 == 0);
+    ref_msk(m1) = 0;
+
+    % Calculate MS-SSIM-M and LD-M
+    [ms_val, ld_val] = evalUnwarp(A1, ref, ref_msk);
+
+    img_time = toc(t_img_start);
+
+    ms_list(i) = ms_val;
+    ld_list(i) = ld_val;
+    time_list(i) = img_time;
+
+    results_cell{i, 1} = i;
+    results_cell{i, 2} = pair.pred_name;
+    results_cell{i, 3} = pair.scan_name;
+    results_cell{i, 4} = ms_val;
+    results_cell{i, 5} = ld_val;
+    results_cell{i, 6} = img_time;
+
+    fprintf('%-5d | %-25s | %-12s | %-9.4f | %-8.2f | %-8.2f\n', ...
+            i, pair.pred_name, pair.scan_name, ms_val, ld_val, img_time);
+    fflush(stdout);
+end
+
+t_all_elapsed = toc(t_all_start);
+mean_ms = mean(ms_list);
+mean_ld = mean(ld_list);
+mean_time = mean(time_list);
+
+fprintf('========================================================================================\n');
+fprintf('OVERALL EVALUATION RESULTS (MATLAB/OCTAVE):\n');
+fprintf('- Total evaluated images: %d\n', num_pairs);
+fprintf('- MS-SSIM-M (↑)         : %.4f\n', mean_ms);
+fprintf('- LD-M (↓)              : %.2f\n', mean_ld);
+fprintf('- Mean time per image   : %.2f s\n', mean_time);
+fprintf('- Total elapsed time    : %.1f s (%.2f min)\n', t_all_elapsed, t_all_elapsed / 60);
+fprintf('========================================================================================\n');
+
+% Save CSV if requested
+if ~isempty(output_csv)
+    [csv_dir, ~, ~] = fileparts(output_csv);
+    if ~isempty(csv_dir) && exist(csv_dir, 'dir') ~= 7
+        mkdir(csv_dir);
+    end
+
+    fid = fopen(output_csv, 'w');
+    if fid ~= -1
+        fprintf(fid, 'Index,Dewarped_Image,Scan_GT,MS_SSIM_M,LD_M,Time_seconds\n');
+        for k = 1:num_pairs
+            fprintf(fid, '%d,%s,%s,%.4f,%.4f,%.2f\n', ...
+                    results_cell{k, 1}, results_cell{k, 2}, results_cell{k, 3}, ...
+                    results_cell{k, 4}, results_cell{k, 5}, results_cell{k, 6});
+        end
+        fprintf(fid, 'SUMMARY,Total: %d,All,%.4f,%.4f,%.2f\n', ...
+                num_pairs, mean_ms, mean_ld, mean_time);
+        fclose(fid);
+        fprintf('Saved detailed metrics to CSV: %s\n', output_csv);
+    else
+        fprintf('Warning: Could not open %s for writing.\n', output_csv);
+    end
+end
+
+end
