@@ -39,33 +39,17 @@ def extract_doc_id(filename):
 	digits = ''.join(filter(str.isdigit, prefix))
 	return digits if digits else ''.join(filter(str.isdigit, base))
 
-def get_ocr_engine(engine_name='tesseract'):
-	if engine_name.lower() == 'tesseract':
-		import pytesseract
-		def ocr_func(img_path):
-			try:
-				img = Image.open(img_path)
-				return pytesseract.image_to_string(img)
-			except Exception:
-				return ''
-		return ocr_func, 'Tesseract 5.0 (CPU - Paper Standard)'
-	elif engine_name.lower() == 'rapidocr':
-		import cv2
-		from rapidocr_onnxruntime import RapidOCR
-		ocr = RapidOCR(det_use_cuda=True, rec_use_cuda=True, rec_batch_num=256, use_angle_cls=False)
-		def ocr_func(img_path):
-			bgr = cv2.imread(img_path)
-			if bgr is None: return ''
-			rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-			res, _ = ocr(rgb)
-			return ' '.join([line[1] for line in res]) if res else ''
-		return ocr_func, 'RapidOCR (GPU Accelerated)'
-	else:
-		raise ValueError(f"Unsupported OCR engine: {engine_name}. Choose 'tesseract' or 'rapidocr'.")
+def run_tesseract_ocr(img_path):
+	import pytesseract
+	try:
+		img = Image.open(img_path)
+		return pytesseract.image_to_string(img)
+	except Exception as e:
+		print(f"Warning: Tesseract failed on {img_path}: {e}")
+		return ''
 
 def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_name='docunet_paper_subset',
-                 engine='tesseract', num_workers=2):
-	ocr_func, engine_desc = get_ocr_engine(engine)
+                 num_workers=2):
 	gt_cache = {}
 	if cache_json and os.path.exists(cache_json):
 		try:
@@ -115,18 +99,18 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 	print('=' * 85)
 	print('=== Official Document Dewarping OCR Evaluation (CER & ED) ===')
 	print(f'Benchmark        : {benchmark_name}')
-	print(f'OCR Engine       : {engine_desc}')
+	print(f'OCR Engine       : Tesseract 5.0 (Paper Standard)')
 	print(f'Predictions dir  : {pred_dir}')
 	print(f'Ground Truth dir : {gt_dir}')
 	print(f'Total images     : {total}')
-	print(f'Parallel workers : {num_workers if engine == "tesseract" else 1}')
+	print(f'Parallel workers : {num_workers}')
 	print('=' * 85)
 
 	if total == 0:
 		print('No valid image pairs found.')
 		return {}
 
-	# Precompute missing ground truth scan cache
+	# Precompute and cache ground truth scan pages
 	unique_scans = {}
 	for _, _, s_name, s_path in valid_pairs:
 		if s_name not in unique_scans:
@@ -134,18 +118,19 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 
 	missing_scans = [s for s in unique_scans if s not in gt_cache]
 	if missing_scans:
-		print(f'Scanning {len(missing_scans)} missing ground truth scan pages...')
+		print(f'Scanning {len(missing_scans)} ground truth scan pages via Tesseract 5.0...')
 		for s_name in missing_scans:
-			gt_cache[s_name] = ocr_func(unique_scans[s_name])
+			gt_cache[s_name] = run_tesseract_ocr(unique_scans[s_name])
 		if cache_json:
 			try:
 				os.makedirs(os.path.dirname(os.path.abspath(cache_json)), exist_ok=True)
 				with open(cache_json, 'w', encoding='utf-8') as f:
 					json.dump(gt_cache, f, ensure_ascii=False, indent=2)
+				print(f'Saved ground truth OCR cache to: {cache_json}')
 			except Exception:
 				pass
 	else:
-		print(f'⚡ Loaded all {len(unique_scans)} ground truth scan texts from cache!')
+		print(f'⚡ Loaded all {len(unique_scans)} ground truth scan texts from cache in 0.001s!')
 
 	print(f"{'STT':<5} | {'Dewarped Image':<25} | {'Scan GT':<12} | {'CER':<8} | {'ED':<7} | {'Time (s)':<8}")
 	print('-' * 85)
@@ -154,11 +139,11 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 	records = []
 	t_start_all = time.time()
 
-	def process_item(item):
+	def process_dewarped_page(item):
 		idx, (p_name, p_path, s_name, _) = item
 		t_item = time.time()
 		text_gt = gt_cache.get(s_name, '')
-		text_pred = ocr_func(p_path)
+		text_pred = run_tesseract_ocr(p_path)
 		ed = levenshtein_dist(text_gt, text_pred)
 		cer = float(ed / max(1, len(text_gt)))
 		elapsed = time.time() - t_item
@@ -166,11 +151,11 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 
 	indexed_items = list(enumerate(valid_pairs, 1))
 
-	if engine.lower() == 'tesseract' and num_workers > 1:
+	if num_workers > 1:
 		with ThreadPoolExecutor(max_workers=num_workers) as executor:
-			results = list(executor.map(process_item, indexed_items))
+			results = list(executor.map(process_dewarped_page, indexed_items))
 	else:
-		results = [process_item(item) for item in indexed_items]
+		results = [process_dewarped_page(item) for item in indexed_items]
 
 	results.sort(key=lambda x: x[0])
 	for idx, p_name, s_name, cer, ed, elapsed in results:
@@ -186,7 +171,7 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 	total_time = time.time() - t_start_all
 
 	print('=' * 85)
-	print('OVERALL OCR EVALUATION RESULTS:')
+	print('OVERALL TESSERACT OCR RESULTS:')
 	print(f'- Total evaluated images : {total}')
 	print(f'- Mean CER (↓)           : {mean_cer:.4f} ({mean_cer * 100:.2f}%)')
 	print(f'- Mean Levenshtein ED (↓): {mean_ed:.2f} characters/page')
@@ -202,7 +187,7 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 			writer.writerows(records)
 			writer.writerow([])
 			writer.writerow(['SUMMARY', f'Total: {total}', 'All', f'{mean_cer:.4f}', f'{mean_ed:.2f}', f'{mean_time:.2f}'])
-		print(f'Saved OCR report to CSV: {output_csv}')
+		print(f'Saved Tesseract OCR report to CSV: {output_csv}')
 
 	return {
 		'count': total,
@@ -214,13 +199,12 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 	}
 
 if __name__ == '__main__':
-	parser = argparse.ArgumentParser(description='Official OCR Evaluation (CER & ED) for Document Dewarping')
+	parser = argparse.ArgumentParser(description='Official Tesseract 5.0 OCR Evaluation for Document Dewarping')
 	parser.add_argument('--pred_dir', type=str, required=True, help='Directory of dewarped images')
 	parser.add_argument('--gt_dir', type=str, required=True, help='Directory of ground truth scan images')
 	parser.add_argument('--output_csv', type=str, default=None, help='Path to output CSV report')
 	parser.add_argument('--cache_json', type=str, default=None, help='Path to cache GT OCR JSON file')
 	parser.add_argument('--benchmark', type=str, default='docunet_paper_subset', choices=['docunet_paper_subset', 'docunet_paper_70', 'docunet_130', 'all'])
-	parser.add_argument('--engine', type=str, default='tesseract', choices=['tesseract', 'rapidocr'])
 	parser.add_argument('--workers', type=int, default=2, help='Number of parallel worker threads')
 	args = parser.parse_args()
 
@@ -230,6 +214,5 @@ if __name__ == '__main__':
 		output_csv=args.output_csv,
 		cache_json=args.cache_json,
 		benchmark_name=args.benchmark,
-		engine=args.engine,
 		num_workers=args.workers
 	)

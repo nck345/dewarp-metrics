@@ -4,9 +4,11 @@ import argparse
 import subprocess
 import tempfile
 import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
-from python.ocr_eval import evaluate_ocr
+from python.ocr_eval import evaluate_ocr, extract_doc_id, PAPER_SUBSET_IDS, PAPER_70_IDS
+from python.ms_ssim_torch import HighPrecisionMSSSIM, evaluate_ms_ssim_pair
 
 def sync_to_local_ssd(src_dir, dst_dir):
 	os.makedirs(dst_dir, exist_ok=True)
@@ -19,8 +21,8 @@ def sync_to_local_ssd(src_dir, dst_dir):
 	return dst_dir
 
 def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_paper_subset',
-                   output_csv=None, ocr_cache_json=None, ocr_engine='tesseract',
-                   octave_bin='octave', num_workers=2, use_local_ssd=True,
+                   output_csv=None, ocr_cache_json=None, octave_bin='octave',
+                   ms_ssim_backend='torch', num_workers=2, use_local_ssd=True,
                    skip_image=False, skip_ocr=False):
 	repo_root = os.path.dirname(os.path.abspath(__file__))
 	matlab_dir = os.path.join(repo_root, 'matlab')
@@ -30,13 +32,13 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 
 	print('=' * 95)
 	print('=== DEWARP-METRICS UNIVERSAL BENCHMARK EVALUATOR ===')
-	print(f'Model Name       : {model_name}')
-	print(f'Benchmark        : {benchmark}')
-	print(f'Dewarped Dir     : {pred_dir}')
-	print(f'Ground Truth Dir : {gt_dir}')
-	print(f'Parallel Workers : {num_workers}')
-	print(f'Image Metrics    : {"SKIP" if skip_image else f"GNU Octave / MATLAB (MS-SSIM-M & LD-M with Masking, {num_workers} workers)"}')
-	print(f'Text Metrics     : {"SKIP" if skip_ocr else f"{ocr_engine.upper()} (CER & Levenshtein ED, {num_workers} workers)"}')
+	print(f'Model Name        : {model_name}')
+	print(f'Benchmark         : {benchmark}')
+	print(f'Dewarped Dir      : {pred_dir}')
+	print(f'Ground Truth Dir  : {gt_dir}')
+	print(f'MS-SSIM-M Backend : {"GPU (PyTorch float64 - Exact)" if ms_ssim_backend == "torch" else "CPU (GNU Octave)"}')
+	print(f'LD-M Backend      : GNU Octave SIFT Flow C++ MEX (-O3 + Scan SIFT Cache + {num_workers} Workers)')
+	print(f'OCR Engine        : Tesseract 5.0 (GT Cache + {num_workers} Workers)')
 	print('=' * 95)
 
 	work_pred_dir = pred_dir
@@ -48,12 +50,71 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 		work_gt_dir = sync_to_local_ssd(gt_dir, f"{local_base}/gt_{benchmark}")
 		print('✅ Local SSD sync complete!')
 
-	df_image = None
+	# Build paired list
+	img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.PNG', '.JPG', '.JPEG')
+	all_pred = [f for f in os.listdir(work_pred_dir) if f.lower().endswith(img_exts)]
+	all_pred.sort()
+
+	valid_pairs = []
+	for p_name in all_pred:
+		doc_id = extract_doc_id(p_name)
+		if benchmark == 'docunet_paper_subset':
+			if doc_id not in PAPER_SUBSET_IDS:
+				continue
+		elif benchmark == 'docunet_paper_70':
+			try:
+				if int(doc_id) not in PAPER_70_IDS:
+					continue
+			except ValueError:
+				continue
+
+		scan_name = None
+		scan_path = None
+		for ext in img_exts:
+			cand = os.path.join(work_gt_dir, f"{doc_id}{ext}")
+			if os.path.exists(cand):
+				scan_name = f"{doc_id}{ext}"
+				scan_path = cand
+				break
+		if not scan_path:
+			name_no_ext = os.path.splitext(p_name)[0]
+			for ext in img_exts:
+				cand = os.path.join(work_gt_dir, f"{name_no_ext}{ext}")
+				if os.path.exists(cand):
+					scan_name = f"{name_no_ext}{ext}"
+					scan_path = cand
+					break
+
+		if scan_path:
+			valid_pairs.append((p_name, os.path.join(work_pred_dir, p_name), scan_name, scan_path))
+
+	df_ms_ssim = None
+	df_ldm = None
 	df_ocr = None
 
-	# 1. IMAGE METRICS EVALUATION (MS-SSIM-M & LD-M)
+	# 1. MS-SSIM-M EVALUATION
+	if not skip_image and ms_ssim_backend == 'torch':
+		print('\n>>> [Step 1/3] Computing MS-SSIM-M on GPU via PyTorch (Double Precision float64)...')
+		import torch
+		dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+		model_ssim = HighPrecisionMSSSIM(device=dev)
+		ms_records = []
+		t_ssim_start = time.time()
+		for idx, (p_name, p_path, s_name, s_path) in enumerate(valid_pairs, 1):
+			t0 = time.time()
+			score = evaluate_ms_ssim_pair(p_path, s_path, model=model_ssim, device=dev)
+			t_el = time.time() - t0
+			ms_records.append({'Dewarped_Image': p_name, 'Scan_GT': s_name, 'MS_SSIM_M': score, 'Time_ssim': t_el})
+			print(f"[{idx}/{len(valid_pairs)}] {p_name:<25} -> {s_name:<10} | MS-SSIM-M: {score:.4f} ({t_el*1000:.1f}ms)")
+		df_ms_ssim = pd.DataFrame(ms_records)
+		t_ssim_total = time.time() - t_ssim_start
+		print(f'✅ MS-SSIM-M GPU Complete! Mean: {df_ms_ssim["MS_SSIM_M"].mean():.4f} in {t_ssim_total:.2f}s')
+
+	# 2. LD-M EVALUATION (OCTAVE SIFT FLOW)
 	if not skip_image:
-		print(f'\n>>> [Step 1/2] Computing MS-SSIM-M and LD-M using GNU Octave ({num_workers} parallel workers)...')
+		skip_octave_ms = (ms_ssim_backend == 'torch')
+		step_name = '2/3' if ms_ssim_backend == 'torch' else '1/2'
+		print(f'\n>>> [Step {step_name}] Computing LD-M via GNU Octave SIFT Flow ({num_workers} parallel workers)...')
 
 		def run_octave_worker(part_idx):
 			with tempfile.NamedTemporaryFile(suffix=f'_image_part{part_idx}.csv', delete=False) as tmp:
@@ -62,10 +123,11 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 			oct_pred = work_pred_dir.replace('\\', '/')
 			oct_gt = work_gt_dir.replace('\\', '/')
 			oct_out = part_csv.replace('\\', '/')
+			skip_ms_arg = 'true' if skip_octave_ms else 'false'
 
 			matlab_script = (
 				f"addpath('{matlab_dir.replace('\\', '/')}'); "
-				f"run_eval_octave('{oct_pred}', '{oct_gt}', '{oct_out}', '{benchmark}', {part_idx}, {num_workers}); "
+				f"run_eval_octave('{oct_pred}', '{oct_gt}', '{oct_out}', '{benchmark}', {part_idx}, {num_workers}, {skip_ms_arg}); "
 				f"exit;"
 			)
 
@@ -89,15 +151,15 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 				part_dfs = list(executor.map(run_octave_worker, range(1, num_workers + 1)))
 			valid_dfs = [df for df in part_dfs if not df.empty]
 			if valid_dfs:
-				df_image = pd.concat(valid_dfs, ignore_index=True)
-				df_image = df_image.sort_values(by=['Dewarped_Image']).reset_index(drop=True)
-				df_image['Index'] = range(1, len(df_image) + 1)
+				df_ldm = pd.concat(valid_dfs, ignore_index=True)
+				df_ldm = df_ldm.sort_values(by=['Dewarped_Image']).reset_index(drop=True)
 		else:
-			df_image = run_octave_worker(1)
+			df_ldm = run_octave_worker(1)
 
-	# 2. TEXT METRICS EVALUATION (CER & ED)
+	# 3. TEXT METRICS EVALUATION (TESSERACT 5.0)
 	if not skip_ocr:
-		print(f'\n>>> [Step 2/2] Computing CER and Levenshtein ED using {ocr_engine.upper()}...')
+		step_name = '3/3' if ms_ssim_backend == 'torch' else '2/2'
+		print(f'\n>>> [Step {step_name}] Computing CER and Levenshtein ED using Tesseract 5.0...')
 		with tempfile.NamedTemporaryFile(suffix='_ocr_metrics.csv', delete=False) as tmp:
 			ocr_csv = tmp.name
 
@@ -107,7 +169,6 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 			output_csv=ocr_csv,
 			cache_json=ocr_cache_json,
 			benchmark_name=benchmark,
-			engine=ocr_engine,
 			num_workers=num_workers
 		)
 
@@ -119,26 +180,26 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 			except Exception:
 				pass
 
-	# 3. MERGE METRICS INTO FINAL REPORT
+	# 4. MERGE METRICS INTO FINAL REPORT
 	print('\n>>> Merging evaluation results...')
-	if df_image is not None and not df_image.empty and df_ocr is not None and not df_ocr.empty:
-		merged = pd.merge(df_image, df_ocr, on=['Dewarped_Image', 'Scan_GT'], how='inner', suffixes=('_img', '_ocr'))
-		merged.insert(1, 'Model', model_name)
-		merged['Index'] = range(1, len(merged) + 1)
-		merged['Time_seconds'] = (pd.to_numeric(merged['Time_seconds_img'], errors='coerce') +
-		                          pd.to_numeric(merged['Time_seconds_ocr'], errors='coerce')).round(2)
-		final_df = merged[['Index', 'Model', 'Dewarped_Image', 'Scan_GT', 'MS_SSIM_M', 'LD_M', 'CER', 'ED', 'Time_seconds']].copy()
-	elif df_image is not None and not df_image.empty:
-		final_df = df_image.copy()
-		final_df.insert(1, 'Model', model_name)
-	elif df_ocr is not None and not df_ocr.empty:
-		final_df = df_ocr.copy()
-		final_df.insert(1, 'Model', model_name)
-	else:
-		print("❌ No evaluation data collected.")
-		return
+	base_df = pd.DataFrame({'Dewarped_Image': [p[0] for p in valid_pairs], 'Scan_GT': [p[2] for p in valid_pairs]})
+	base_df.insert(0, 'Model', model_name)
+	base_df.insert(0, 'Index', range(1, len(base_df) + 1))
 
-	# Add summary row
+	if df_ms_ssim is not None and not df_ms_ssim.empty:
+		base_df = pd.merge(base_df, df_ms_ssim[['Dewarped_Image', 'Scan_GT', 'MS_SSIM_M']], on=['Dewarped_Image', 'Scan_GT'], how='left')
+	elif df_ldm is not None and not df_ldm.empty and 'MS_SSIM_M' in df_ldm.columns:
+		base_df = pd.merge(base_df, df_ldm[['Dewarped_Image', 'Scan_GT', 'MS_SSIM_M']], on=['Dewarped_Image', 'Scan_GT'], how='left')
+
+	if df_ldm is not None and not df_ldm.empty:
+		base_df = pd.merge(base_df, df_ldm[['Dewarped_Image', 'Scan_GT', 'LD_M', 'Time_seconds']], on=['Dewarped_Image', 'Scan_GT'], how='left')
+
+	if df_ocr is not None and not df_ocr.empty:
+		base_df = pd.merge(base_df, df_ocr[['Dewarped_Image', 'Scan_GT', 'CER', 'ED']], on=['Dewarped_Image', 'Scan_GT'], how='left')
+
+	final_df = base_df.copy()
+
+	# Summary row
 	n_samples = len(final_df)
 	summary_dict = {'Index': 'SUMMARY', 'Model': model_name, 'Dewarped_Image': f'Total: {n_samples}', 'Scan_GT': 'All'}
 
@@ -172,8 +233,9 @@ if __name__ == '__main__':
 	                    choices=['docunet_paper_subset', 'docunet_paper_70', 'docunet_130', 'all'])
 	parser.add_argument('--output_csv', type=str, default=None, help='Path to output merged CSV report')
 	parser.add_argument('--ocr_cache_json', type=str, default=None, help='Path to cache GT OCR JSON')
-	parser.add_argument('--ocr_engine', type=str, default='tesseract', choices=['tesseract', 'rapidocr'])
 	parser.add_argument('--octave_bin', type=str, default='octave', help='Path to GNU Octave executable')
+	parser.add_argument('--ms_ssim_backend', type=str, default='torch', choices=['torch', 'octave'],
+	                    help='Backend for MS-SSIM-M: torch (GPU float64 exact) or octave (CPU)')
 	parser.add_argument('--workers', type=int, default=2, help='Number of parallel workers')
 	parser.add_argument('--no_ssd_cache', action='store_true', help='Disable local SSD caching')
 	parser.add_argument('--skip_image', action='store_true', help='Skip image metrics (MS-SSIM-M & LD-M)')
@@ -187,8 +249,8 @@ if __name__ == '__main__':
 		benchmark=args.benchmark,
 		output_csv=args.output_csv,
 		ocr_cache_json=args.ocr_cache_json,
-		ocr_engine=args.ocr_engine,
 		octave_bin=args.octave_bin,
+		ms_ssim_backend=args.ms_ssim_backend,
 		num_workers=args.workers,
 		use_local_ssd=not args.no_ssd_cache,
 		skip_image=args.skip_image,
