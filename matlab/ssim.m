@@ -66,3 +66,4 @@ valid_map = ssim_map(f(1)+1:end-f(1), f(2)+1:end-f(2));
 mssim = mean(valid_map(:));
 
 end
+

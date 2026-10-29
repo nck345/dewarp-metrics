@@ -17,3 +17,4 @@ mex mexDiscreteFlow.cpp BPFlow.cpp Stochastic.cpp
 
 cd(cur_dir);
 fprintf('✅ MATLAB MEX compilation completed successfully!\n');
+

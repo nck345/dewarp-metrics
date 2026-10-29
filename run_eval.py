@@ -3,12 +3,25 @@ import sys
 import argparse
 import subprocess
 import tempfile
+import shutil
+from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 from python.ocr_eval import evaluate_ocr
 
+def sync_to_local_ssd(src_dir, dst_dir):
+	os.makedirs(dst_dir, exist_ok=True)
+	files = os.listdir(src_dir)
+	for f in files:
+		s_path = os.path.join(src_dir, f)
+		d_path = os.path.join(dst_dir, f)
+		if os.path.isfile(s_path) and not os.path.exists(d_path):
+			shutil.copy2(s_path, d_path)
+	return dst_dir
+
 def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_paper_subset',
                    output_csv=None, ocr_cache_json=None, ocr_engine='tesseract',
-                   octave_bin='octave', skip_image=False, skip_ocr=False):
+                   octave_bin='octave', num_workers=2, use_local_ssd=True,
+                   skip_image=False, skip_ocr=False):
 	repo_root = os.path.dirname(os.path.abspath(__file__))
 	matlab_dir = os.path.join(repo_root, 'matlab')
 
@@ -21,59 +34,81 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 	print(f'Benchmark        : {benchmark}')
 	print(f'Dewarped Dir     : {pred_dir}')
 	print(f'Ground Truth Dir : {gt_dir}')
-	print(f'Image Metrics    : {"SKIP" if skip_image else "GNU Octave / MATLAB (MS-SSIM-M & LD-M with Masking)"}')
-	print(f'Text Metrics     : {"SKIP" if skip_ocr else f"{ocr_engine.upper()} (CER & Levenshtein ED)"}')
+	print(f'Parallel Workers : {num_workers}')
+	print(f'Image Metrics    : {"SKIP" if skip_image else f"GNU Octave / MATLAB (MS-SSIM-M & LD-M with Masking, {num_workers} workers)"}')
+	print(f'Text Metrics     : {"SKIP" if skip_ocr else f"{ocr_engine.upper()} (CER & Levenshtein ED, {num_workers} workers)"}')
 	print('=' * 95)
+
+	work_pred_dir = pred_dir
+	work_gt_dir = gt_dir
+	if use_local_ssd and '/content/drive' in pred_dir:
+		print('🚀 Syncing images to local NVMe SSD (/content/) for maximum I/O speed...')
+		local_base = '/content/benchmark_cache'
+		work_pred_dir = sync_to_local_ssd(pred_dir, f"{local_base}/pred_{model_name}_{benchmark}")
+		work_gt_dir = sync_to_local_ssd(gt_dir, f"{local_base}/gt_{benchmark}")
+		print('✅ Local SSD sync complete!')
 
 	df_image = None
 	df_ocr = None
 
 	# 1. IMAGE METRICS EVALUATION (MS-SSIM-M & LD-M)
 	if not skip_image:
-		print('\n>>> [Step 1/2] Computing MS-SSIM-M and LD-M using GNU Octave / MATLAB...')
-		with tempfile.NamedTemporaryFile(suffix='_image_metrics.csv', delete=False) as tmp:
-			octave_csv = tmp.name
+		print(f'\n>>> [Step 1/2] Computing MS-SSIM-M and LD-M using GNU Octave ({num_workers} parallel workers)...')
 
-		oct_pred = pred_dir.replace('\\', '/')
-		oct_gt = gt_dir.replace('\\', '/')
-		oct_out = octave_csv.replace('\\', '/')
+		def run_octave_worker(part_idx):
+			with tempfile.NamedTemporaryFile(suffix=f'_image_part{part_idx}.csv', delete=False) as tmp:
+				part_csv = tmp.name
 
-		matlab_script = (
-			f"addpath('{matlab_dir.replace('\\', '/')}'); "
-			f"run_eval_octave('{oct_pred}', '{oct_gt}', '{oct_out}', '{benchmark}'); "
-			f"exit;"
-		)
+			oct_pred = work_pred_dir.replace('\\', '/')
+			oct_gt = work_gt_dir.replace('\\', '/')
+			oct_out = part_csv.replace('\\', '/')
 
-		octave_cmd = [octave_bin, '--no-gui', '--silent', '--eval', matlab_script]
-		try:
-			subprocess.run(octave_cmd, check=True)
-			if os.path.exists(octave_csv):
-				df_image = pd.read_csv(octave_csv)
-				df_image = df_image[df_image['Index'] != 'SUMMARY'].copy()
-				try:
-					os.remove(octave_csv)
-				except Exception:
-					pass
-		except FileNotFoundError:
-			print(f"❌ Error: '{octave_bin}' not found in PATH. Install octave via: apt-get install -y octave octave-image")
-			if skip_ocr: return
-		except subprocess.CalledProcessError as e:
-			print(f"❌ Error during Octave execution (exit code {e.returncode}).")
-			if skip_ocr: return
+			matlab_script = (
+				f"addpath('{matlab_dir.replace('\\', '/')}'); "
+				f"run_eval_octave('{oct_pred}', '{oct_gt}', '{oct_out}', '{benchmark}', {part_idx}, {num_workers}); "
+				f"exit;"
+			)
+
+			octave_cmd = [octave_bin, '--no-gui', '--silent', '--eval', matlab_script]
+			try:
+				subprocess.run(octave_cmd, check=True)
+				if os.path.exists(part_csv):
+					df = pd.read_csv(part_csv)
+					df = df[df['Index'] != 'SUMMARY'].copy()
+					try:
+						os.remove(part_csv)
+					except Exception:
+						pass
+					return df
+			except Exception as e:
+				print(f"❌ Error in Octave worker {part_idx}: {e}")
+			return pd.DataFrame()
+
+		if num_workers > 1:
+			with ThreadPoolExecutor(max_workers=num_workers) as executor:
+				part_dfs = list(executor.map(run_octave_worker, range(1, num_workers + 1)))
+			valid_dfs = [df for df in part_dfs if not df.empty]
+			if valid_dfs:
+				df_image = pd.concat(valid_dfs, ignore_index=True)
+				df_image = df_image.sort_values(by=['Dewarped_Image']).reset_index(drop=True)
+				df_image['Index'] = range(1, len(df_image) + 1)
+		else:
+			df_image = run_octave_worker(1)
 
 	# 2. TEXT METRICS EVALUATION (CER & ED)
 	if not skip_ocr:
-		print('\n>>> [Step 2/2] Computing CER and Levenshtein ED using OCR...')
+		print(f'\n>>> [Step 2/2] Computing CER and Levenshtein ED using {ocr_engine.upper()}...')
 		with tempfile.NamedTemporaryFile(suffix='_ocr_metrics.csv', delete=False) as tmp:
 			ocr_csv = tmp.name
 
 		evaluate_ocr(
-			pred_dir=pred_dir,
-			gt_dir=gt_dir,
+			pred_dir=work_pred_dir,
+			gt_dir=work_gt_dir,
 			output_csv=ocr_csv,
 			cache_json=ocr_cache_json,
 			benchmark_name=benchmark,
-			engine=ocr_engine
+			engine=ocr_engine,
+			num_workers=num_workers
 		)
 
 		if os.path.exists(ocr_csv):
@@ -86,17 +121,17 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 
 	# 3. MERGE METRICS INTO FINAL REPORT
 	print('\n>>> Merging evaluation results...')
-	if df_image is not None and df_ocr is not None:
+	if df_image is not None and not df_image.empty and df_ocr is not None and not df_ocr.empty:
 		merged = pd.merge(df_image, df_ocr, on=['Dewarped_Image', 'Scan_GT'], how='inner', suffixes=('_img', '_ocr'))
 		merged.insert(1, 'Model', model_name)
 		merged['Index'] = range(1, len(merged) + 1)
 		merged['Time_seconds'] = (pd.to_numeric(merged['Time_seconds_img'], errors='coerce') +
 		                          pd.to_numeric(merged['Time_seconds_ocr'], errors='coerce')).round(2)
 		final_df = merged[['Index', 'Model', 'Dewarped_Image', 'Scan_GT', 'MS_SSIM_M', 'LD_M', 'CER', 'ED', 'Time_seconds']].copy()
-	elif df_image is not None:
+	elif df_image is not None and not df_image.empty:
 		final_df = df_image.copy()
 		final_df.insert(1, 'Model', model_name)
-	elif df_ocr is not None:
+	elif df_ocr is not None and not df_ocr.empty:
 		final_df = df_ocr.copy()
 		final_df.insert(1, 'Model', model_name)
 	else:
@@ -139,6 +174,8 @@ if __name__ == '__main__':
 	parser.add_argument('--ocr_cache_json', type=str, default=None, help='Path to cache GT OCR JSON')
 	parser.add_argument('--ocr_engine', type=str, default='tesseract', choices=['tesseract', 'rapidocr'])
 	parser.add_argument('--octave_bin', type=str, default='octave', help='Path to GNU Octave executable')
+	parser.add_argument('--workers', type=int, default=2, help='Number of parallel workers')
+	parser.add_argument('--no_ssd_cache', action='store_true', help='Disable local SSD caching')
 	parser.add_argument('--skip_image', action='store_true', help='Skip image metrics (MS-SSIM-M & LD-M)')
 	parser.add_argument('--skip_ocr', action='store_true', help='Skip OCR metrics (CER & ED)')
 	args = parser.parse_args()
@@ -152,6 +189,8 @@ if __name__ == '__main__':
 		ocr_cache_json=args.ocr_cache_json,
 		ocr_engine=args.ocr_engine,
 		octave_bin=args.octave_bin,
+		num_workers=args.workers,
+		use_local_ssd=not args.no_ssd_cache,
 		skip_image=args.skip_image,
 		skip_ocr=args.skip_ocr
 	)

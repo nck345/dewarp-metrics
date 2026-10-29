@@ -1,9 +1,9 @@
-function run_eval_octave(pred_dir, gt_dir, output_csv, benchmark_name)
+function run_eval_octave(pred_dir, gt_dir, output_csv, benchmark_name, part_idx, total_parts)
 % RUN_EVAL_OCTAVE Universal Headless Image Metrics Runner (MS-SSIM-M & LD-M)
 % Compatible with GNU Octave (Google Colab / Linux / Windows) and MATLAB.
 
 if nargin < 2
-    error('Usage: run_eval_octave(pred_dir, gt_dir, [output_csv], [benchmark_name])');
+    error('Usage: run_eval_octave(pred_dir, gt_dir, [output_csv], [benchmark_name], [part_idx], [total_parts])');
 end
 
 if nargin < 3 || isempty(output_csv)
@@ -12,6 +12,20 @@ end
 
 if nargin < 4 || isempty(benchmark_name)
     benchmark_name = 'all';
+end
+
+if nargin < 5 || isempty(part_idx)
+    part_idx = 1;
+end
+if nargin < 6 || isempty(total_parts)
+    total_parts = 1;
+end
+
+if ischar(part_idx)
+    part_idx = str2double(part_idx);
+end
+if ischar(total_parts)
+    total_parts = str2double(total_parts);
 end
 
 % Setup paths
@@ -31,11 +45,11 @@ if exist('OCTAVE_VERSION', 'builtin')
     more off;
 end
 
-% Check MEX binaries
-if exist('mexDenseSIFT') ~= 3
+% Check MEX binaries (3 = mex, 103 = oct)
+if exist('mexDenseSIFT') ~= 3 && exist('mexDenseSIFT') ~= 103
     error('mexDenseSIFT MEX binary not found! Please run compile_mex script first.');
 end
-if exist('mexDiscreteFlow') ~= 3
+if exist('mexDiscreteFlow') ~= 3 && exist('mexDiscreteFlow') ~= 103
     error('mexDiscreteFlow MEX binary not found! Please run compile_mex script first.');
 end
 
@@ -108,13 +122,27 @@ for k = 1:length(pred_list)
     end
 end
 
+if total_parts > 1
+    my_pairs = {};
+    for k = 1:length(valid_pairs)
+        if mod(k - 1, total_parts) + 1 == part_idx
+            my_pairs{end+1} = valid_pairs{k};
+        end
+    end
+    valid_pairs = my_pairs;
+end
+
 num_pairs = length(valid_pairs);
 fprintf('========================================================================================\n');
-fprintf('=== Official MATLAB/Octave Image Evaluation (MS-SSIM-M & LD-M) ===\n');
+if total_parts > 1
+    fprintf('=== Official MATLAB/Octave Image Evaluation [Worker %d/%d] (MS-SSIM-M & LD-M) ===\n', part_idx, total_parts);
+else
+    fprintf('=== Official MATLAB/Octave Image Evaluation (MS-SSIM-M & LD-M) ===\n');
+end
 fprintf('Benchmark       : %s\n', benchmark_name);
 fprintf('Predictions dir : %s\n', pred_dir);
 fprintf('Ground Truth dir: %s\n', gt_dir);
-fprintf('Total images    : %d\n', num_pairs);
+fprintf('Worker images   : %d\n', num_pairs);
 fprintf('========================================================================================\n');
 fprintf('%-5s | %-25s | %-12s | %-9s | %-8s | %-8s\n', 'STT', 'Dewarped Image', 'Scan GT', 'MS-SSIM-M', 'LD-M', 'Time (s)');
 fprintf('----------------------------------------------------------------------------------------\n');
@@ -218,3 +246,4 @@ if ~isempty(output_csv)
 end
 
 end
+

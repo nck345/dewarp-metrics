@@ -134,3 +134,4 @@ Standard 30 scan IDs for `docunet_paper_subset` (Setting 1):
 
 Each scan corresponds to 2 warped test instances (`_1` and `_2`), yielding exactly 60 test images.
 Target scan area for resolution normalization: `598400` pixels (~800 x 748).
+

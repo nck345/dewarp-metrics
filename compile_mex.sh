@@ -10,11 +10,12 @@ echo "=== Compiling SIFT Flow MEX for GNU Octave ==="
 
 echo "1/2 Compiling mexDenseSIFT..."
 cd "$MEX_DENSE"
-mkoctfile --mex mexDenseSIFT.cpp Matrix.cpp Vector.cpp -o mexDenseSIFT.mex
+mkoctfile -O3 --mex mexDenseSIFT.cpp Matrix.cpp Vector.cpp -o mexDenseSIFT.mex
 
 echo "2/2 Compiling mexDiscreteFlow..."
 cd "$MEX_FLOW"
-mkoctfile --mex mexDiscreteFlow.cpp BPFlow.cpp Stochastic.cpp -o mexDiscreteFlow.mex
+mkoctfile -O3 --mex mexDiscreteFlow.cpp BPFlow.cpp Stochastic.cpp -o mexDiscreteFlow.mex
 
 cd "$SCRIPT_DIR"
 echo "✅ Compilation completed successfully! MEX files are ready in matlab/SIFTflow/"
+
