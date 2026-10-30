@@ -204,7 +204,8 @@ if __name__ == '__main__':
 	parser.add_argument('--gt_dir', type=str, required=True, help='Directory of ground truth scan images')
 	parser.add_argument('--output_csv', type=str, default=None, help='Path to output CSV report')
 	parser.add_argument('--cache_json', type=str, default=None, help='Path to cache GT OCR JSON file')
-	parser.add_argument('--benchmark', type=str, default='docunet_paper_subset', choices=['docunet_paper_subset', 'docunet_paper_70', 'docunet_130', 'all'])
+	parser.add_argument('--benchmark', type=str, default='docunet_paper_subset',
+	                    choices=['docunet_paper_subset', 'docunet_paper_70', 'docunet_130', 'dir300', 'docreal', 'all'])
 	parser.add_argument('--workers', type=int, default=2, help='Number of parallel worker threads')
 	args = parser.parse_args()
 

@@ -109,3 +109,4 @@ def evaluate_ms_ssim_pair(pred_path, scan_path, model=None, tarea=598400, device
 	pred_d = pred_resized.to(device=device, dtype=torch.float64)
 
 	return model(pred_d, scan_d)
+

@@ -70,6 +70,8 @@ Available arguments:
   - `docunet_paper_subset`: 60 images corresponding to 30 paper scan IDs (Setting 1).
   - `docunet_paper_70`: 70 images list from original paper OCR script.
   - `docunet_130`: Full 130 images of DocUNet benchmark.
+  - `dir300`: Full 300 real/synthetic image pairs of DIR300 benchmark.
+  - `docreal`: Full 200 real camera-captured image pairs across 50 documents of DocReal benchmark.
   - `all`: All image pairs found in directory.
 - `--ms_ssim_backend`: `torch` (GPU float64, default) or `octave` (CPU).
 - `--workers`: Number of parallel worker processes/threads (default: 2).
