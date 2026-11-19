@@ -65,6 +65,19 @@ python run_eval.py \
   --workers 2
 ```
 
+### Batch Multi-Benchmark Suite Evaluation
+
+Evaluate across multiple or all benchmarks in one command:
+```bash
+python run_eval.py \
+  --base_dir "/path/to/Document_Dewarp_Benchmark" \
+  --model_name "DocTr" \
+  --benchmarks docunet_paper_subset dir300 docreal \
+  --ms_ssim_backend "torch" \
+  --workers 2
+```
+Use `--benchmarks all` to evaluate all benchmarks. A master summary table is printed and saved to `eval_reports/<Model>_ALL_BENCHMARKS_SUMMARY.csv`.
+
 Available arguments:
 - `--benchmark`: Subset to evaluate:
   - `docunet_paper_subset`: 60 images corresponding to 30 paper scan IDs (Setting 1).
