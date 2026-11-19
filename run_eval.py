@@ -197,37 +197,38 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 	if df_ocr is not None and not df_ocr.empty:
 		base_df = pd.merge(base_df, df_ocr[['Dewarped_Image', 'Scan_GT', 'CER', 'ED']], on=['Dewarped_Image', 'Scan_GT'], how='left')
 
-	final_df = base_df.copy()
-
 	# Summary row
-	n_samples = len(final_df)
-	summary_dict = {'Index': 'SUMMARY', 'Model': model_name, 'Dewarped_Image': f'Total: {n_samples}', 'Scan_GT': 'All'}
+	n_samples = len(valid_pairs)
+	summary_dict = {'Model': model_name, 'Benchmark': benchmark, 'Images': n_samples}
 
-	for col in ['MS_SSIM_M', 'LD_M', 'CER', 'ED', 'Time_seconds']:
-		if col in final_df.columns:
-			summary_dict[col] = round(pd.to_numeric(final_df[col], errors='coerce').mean(), 4 if col in ['MS_SSIM_M', 'CER'] else 2)
+	for col in ['MS_SSIM_M', 'LD_M', 'CER', 'ED']:
+		if col in base_df.columns:
+			summary_dict[col] = round(pd.to_numeric(base_df[col], errors='coerce').mean(), 4 if col in ['MS_SSIM_M', 'CER'] else 2)
 
 	summary_df = pd.DataFrame([summary_dict])
-	report_df = pd.concat([final_df, summary_df], ignore_index=True)
 
-	print('\n' + '=' * 95)
+	print('\n' + '=' * 85)
 	print(f'=== FINAL BENCHMARK SUMMARY FOR [{model_name.upper()}] ON [{benchmark.upper()}] ===')
 	for col, val in summary_dict.items():
-		if col not in ['Index', 'Model', 'Dewarped_Image', 'Scan_GT']:
-			print(f'- {col:<15}: {val}')
-	print('=' * 95)
+		print(f'- {col:<15}: {val}')
+	print('=' * 85)
 
 	if output_csv:
 		os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
-		report_df.to_csv(output_csv, index=False, encoding='utf-8')
-		print(f'\n✅ Comprehensive report saved to: {output_csv}')
+		if save_details:
+			detail_df = pd.concat([base_df, summary_df], ignore_index=True)
+			detail_df.to_csv(output_csv, index=False, encoding='utf-8')
+			print(f'\nDetailed report saved to: {output_csv}')
+		else:
+			summary_df.to_csv(output_csv, index=False, encoding='utf-8')
+			print(f'\nSummary report saved to: {output_csv}')
 
-	return report_df
+	return summary_df
 
 def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
                         octave_bin='octave', ms_ssim_backend='torch',
                         num_workers=2, use_local_ssd=True,
-                        skip_image=False, skip_ocr=False):
+                        skip_image=False, skip_ocr=False, save_details=False):
 	all_supported = ['docunet_paper_subset', 'docunet_130', 'dir300', 'docreal']
 	if benchmarks is None or benchmarks == 'all' or (isinstance(benchmarks, (list, tuple)) and 'all' in benchmarks):
 		target_bms = all_supported
@@ -265,50 +266,59 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 			print(f'Warning: Predictions directory not found for {bm}: {pred_dir}. Skipping.')
 			continue
 
-		report_dir = os.path.join(base_dir, 'eval_reports')
-		os.makedirs(report_dir, exist_ok=True)
-		save_csv = os.path.join(report_dir, f'{model_name}_{bm}_metrics.csv')
-
 		cache_dir = os.path.join(base_dir, 'gt_cache')
 		os.makedirs(cache_dir, exist_ok=True)
 		ocr_cache_json = os.path.join(cache_dir, f'{bm}_tesseract_cache.json')
 
-		df_rep = run_evaluation(
+		detail_csv = os.path.join(base_dir, 'eval_reports', f'{model_name}_{bm}_details.csv') if save_details else None
+
+		df_sum = run_evaluation(
 			pred_dir=pred_dir,
 			gt_dir=gt_dir,
 			model_name=model_name,
 			benchmark=bm,
-			output_csv=save_csv,
+			output_csv=detail_csv,
 			ocr_cache_json=ocr_cache_json,
 			octave_bin=octave_bin,
 			ms_ssim_backend=ms_ssim_backend,
 			num_workers=num_workers,
 			use_local_ssd=use_local_ssd,
 			skip_image=skip_image,
-			skip_ocr=skip_ocr
+			skip_ocr=skip_ocr,
+			save_details=save_details
 		)
 
-		if df_rep is not None and not df_rep.empty:
-			summary_row = df_rep[df_rep['Index'] == 'SUMMARY']
-			if not summary_row.empty:
-				s_dict = summary_row.iloc[0].to_dict()
-				s_dict['Benchmark'] = bm
-				suite_summaries.append(s_dict)
+		if df_sum is not None and not df_sum.empty:
+			suite_summaries.append(df_sum)
 
 	if suite_summaries:
-		master_df = pd.DataFrame(suite_summaries)
-		cols_order = ['Benchmark', 'Model', 'Dewarped_Image', 'MS_SSIM_M', 'LD_M', 'CER', 'ED', 'Time_seconds']
-		avail_cols = [c for c in cols_order if c in master_df.columns]
-		other_cols = [c for c in master_df.columns if c not in cols_order and c != 'Index']
-		master_df = master_df[avail_cols + other_cols]
+		master_df = pd.concat(suite_summaries, ignore_index=True)
+		report_dir = os.path.join(base_dir, 'eval_reports')
+		os.makedirs(report_dir, exist_ok=True)
 
-		master_csv = os.path.join(base_dir, 'eval_reports', f'{model_name}_ALL_BENCHMARKS_SUMMARY.csv')
-		master_df.to_csv(master_csv, index=False, encoding='utf-8')
+		# 1. Model summary CSV: <Model>_summary.csv
+		model_summary_csv = os.path.join(report_dir, f'{model_name}_summary.csv')
+		master_df.to_csv(model_summary_csv, index=False, encoding='utf-8')
+
+		# 2. Consolidated benchmark_summary.csv across all models
+		all_summary_csv = os.path.join(report_dir, 'benchmark_summary.csv')
+		if os.path.exists(all_summary_csv):
+			try:
+				existing_df = pd.read_csv(all_summary_csv)
+				mask = (existing_df['Model'] == model_name) & (existing_df['Benchmark'].isin(master_df['Benchmark']))
+				existing_df = existing_df[~mask]
+				merged_df = pd.concat([existing_df, master_df], ignore_index=True)
+			except Exception:
+				merged_df = master_df
+		else:
+			merged_df = master_df
+		merged_df.to_csv(all_summary_csv, index=False, encoding='utf-8')
 
 		print('\n' + '=' * 95)
-		print(f'=== MASTER SUITE SUMMARY FOR [{model_name.upper()}] ({time.time() - t_start:.1f}s) ===')
+		print(f'=== MASTER BENCHMARK SUMMARY FOR [{model_name.upper()}] ({time.time() - t_start:.1f}s) ===')
 		print(master_df.to_string(index=False))
-		print(f'\n✅ Master suite summary saved to: {master_csv}')
+		print(f'\n✅ Model summary saved to           : {model_summary_csv}')
+		print(f'✅ Consolidated leaderboard saved to: {all_summary_csv}')
 		print('=' * 95)
 		return master_df
 
@@ -332,6 +342,7 @@ if __name__ == '__main__':
 	parser.add_argument('--no_ssd_cache', action='store_true', help='Disable local SSD caching')
 	parser.add_argument('--skip_image', action='store_true', help='Skip image metrics (MS-SSIM-M & LD-M)')
 	parser.add_argument('--skip_ocr', action='store_true', help='Skip OCR metrics (CER & ED)')
+	parser.add_argument('--save_details', action='store_true', help='Save per-image detailed metrics CSV (default: False)')
 	args = parser.parse_args()
 
 	if args.base_dir:
@@ -344,7 +355,8 @@ if __name__ == '__main__':
 			num_workers=args.workers,
 			use_local_ssd=not args.no_ssd_cache,
 			skip_image=args.skip_image,
-			skip_ocr=args.skip_ocr
+			skip_ocr=args.skip_ocr,
+			save_details=args.save_details
 		)
 	else:
 		if not args.pred_dir or not args.gt_dir:
@@ -361,5 +373,6 @@ if __name__ == '__main__':
 			num_workers=args.workers,
 			use_local_ssd=not args.no_ssd_cache,
 			skip_image=args.skip_image,
-			skip_ocr=args.skip_ocr
+			skip_ocr=args.skip_ocr,
+			save_details=args.save_details
 		)
