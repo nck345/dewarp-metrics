@@ -268,7 +268,7 @@ void Vector::readVector(const mxArray* prhs)
 	int nElements = mxGetNumberOfDimensions(prhs);
 	if(nElements>2)
 		mexErrMsgTxt("A vector is expected to be loaded!");
-	const int* dims = mxGetDimensions(prhs);
+	const mwSize* dims = mxGetDimensions(prhs);
 	nDim = dims[0]*dims[1];
 	pData = new double[nDim];
 	memcpy(pData,(double*)mxGetData(prhs),sizeof(double)*nDim);
@@ -276,7 +276,7 @@ void Vector::readVector(const mxArray* prhs)
 
 void Vector::writeVector(mxArray*& plhs) const
 {
-	int dims[2];
+	mwSize dims[2];
 	dims[0]=nDim;dims[1]=1;
 	plhs=mxCreateNumericArray(2, dims,mxDOUBLE_CLASS, mxREAL);
     memcpy((double *)mxGetData(plhs),pData,sizeof(double)*nDim);

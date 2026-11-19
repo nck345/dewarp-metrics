@@ -5,8 +5,10 @@ import subprocess
 import tempfile
 import shutil
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
+from tqdm.auto import tqdm
 from python.ocr_eval import evaluate_ocr, extract_doc_id, PAPER_SUBSET_IDS, PAPER_70_IDS
 from python.ms_ssim_torch import HighPrecisionMSSSIM, evaluate_ms_ssim_pair
 
@@ -100,12 +102,14 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 		model_ssim = HighPrecisionMSSSIM(device=dev)
 		ms_records = []
 		t_ssim_start = time.time()
-		for idx, (p_name, p_path, s_name, s_path) in enumerate(valid_pairs, 1):
-			t0 = time.time()
-			score = evaluate_ms_ssim_pair(p_path, s_path, model=model_ssim, device=dev)
-			t_el = time.time() - t0
-			ms_records.append({'Dewarped_Image': p_name, 'Scan_GT': s_name, 'MS_SSIM_M': score, 'Time_ssim': t_el})
-			print(f"[{idx}/{len(valid_pairs)}] {p_name:<25} -> {s_name:<10} | MS-SSIM-M: {score:.4f} ({t_el*1000:.1f}ms)")
+		with tqdm(total=len(valid_pairs), desc=f"MS-SSIM-M GPU [{benchmark}]", unit="img", ncols=95) as pbar:
+			for p_name, p_path, s_name, s_path in valid_pairs:
+				t0 = time.time()
+				score = evaluate_ms_ssim_pair(p_path, s_path, model=model_ssim, device=dev)
+				t_el = time.time() - t0
+				ms_records.append({'Dewarped_Image': p_name, 'Scan_GT': s_name, 'MS_SSIM_M': score, 'Time_ssim': t_el})
+				pbar.update(1)
+				pbar.set_postfix({'Score': f"{score:.4f}"})
 		df_ms_ssim = pd.DataFrame(ms_records)
 		t_ssim_total = time.time() - t_ssim_start
 		print(f'✅ MS-SSIM-M GPU Complete! Mean: {df_ms_ssim["MS_SSIM_M"].mean():.4f} in {t_ssim_total:.2f}s')
@@ -115,6 +119,10 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 		skip_octave_ms = (ms_ssim_backend == 'torch')
 		step_name = '2/3' if ms_ssim_backend == 'torch' else '1/2'
 		print(f'\n>>> [Step {step_name}] Computing LD-M via GNU Octave SIFT Flow ({num_workers} parallel workers)...')
+		t_ldm_start = time.time()
+
+		pbar_ldm = tqdm(total=len(valid_pairs), desc=f"LD-M Octave [{benchmark}]", unit="img", ncols=95)
+		pbar_lock = threading.Lock()
 
 		def run_octave_worker(part_idx):
 			with tempfile.NamedTemporaryFile(suffix=f'_image_part{part_idx}.csv', delete=False) as tmp:
@@ -132,8 +140,26 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 			)
 
 			octave_cmd = [octave_bin, '--no-gui', '--silent', '--eval', matlab_script]
+			err_lines = []
 			try:
-				subprocess.run(octave_cmd, check=True)
+				proc = subprocess.Popen(
+					octave_cmd,
+					stdout=subprocess.PIPE,
+					stderr=subprocess.STDOUT,
+					text=True,
+					bufsize=1
+				)
+				for line in proc.stdout:
+					if 'PROGRESS_DONE:' in line:
+						with pbar_lock:
+							pbar_ldm.update(1)
+					else:
+						err_lines.append(line)
+				proc.wait()
+				if proc.returncode != 0:
+					print(f"❌ Error in Octave worker {part_idx} (exit code {proc.returncode}):")
+					for l in err_lines[-15:]:
+						print(f"   {l.strip()}")
 				if os.path.exists(part_csv):
 					df = pd.read_csv(part_csv)
 					df = df[df['Index'] != 'SUMMARY'].copy()
@@ -155,6 +181,11 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 				df_ldm = df_ldm.sort_values(by=['Dewarped_Image']).reset_index(drop=True)
 		else:
 			df_ldm = run_octave_worker(1)
+
+		pbar_ldm.close()
+		t_ldm_total = time.time() - t_ldm_start
+		if df_ldm is not None and not df_ldm.empty:
+			print(f'✅ LD-M Octave Complete! Mean: {df_ldm["LD_M"].mean():.2f} in {t_ldm_total:.2f}s')
 
 	# 3. TEXT METRICS EVALUATION (TESSERACT 5.0)
 	if not skip_ocr:

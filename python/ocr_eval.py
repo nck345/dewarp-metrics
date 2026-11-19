@@ -6,6 +6,7 @@ import csv
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image
+from tqdm.auto import tqdm
 
 try:
 	import rapidfuzz.distance.Levenshtein as rf_lev
@@ -118,9 +119,16 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 
 	missing_scans = [s for s in unique_scans if s not in gt_cache]
 	if missing_scans:
-		print(f'Scanning {len(missing_scans)} ground truth scan pages via Tesseract 5.0...')
-		for s_name in missing_scans:
-			gt_cache[s_name] = run_tesseract_ocr(unique_scans[s_name])
+		def scan_worker(s_name):
+			return s_name, run_tesseract_ocr(unique_scans[s_name])
+
+		with ThreadPoolExecutor(max_workers=min(num_workers, len(missing_scans))) as scan_exec:
+			futures = [scan_exec.submit(scan_worker, s) for s in missing_scans]
+			with tqdm(total=len(missing_scans), desc=f"OCR Scan GT [{benchmark_name}]", unit="page", ncols=95) as pbar:
+				for fut in futures:
+					s_name, text = fut.result()
+					gt_cache[s_name] = text
+					pbar.update(1)
 		if cache_json:
 			try:
 				os.makedirs(os.path.dirname(os.path.abspath(cache_json)), exist_ok=True)
@@ -131,9 +139,6 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 				pass
 	else:
 		print(f'⚡ Loaded all {len(unique_scans)} ground truth scan texts from cache in 0.001s!')
-
-	print(f"{'STT':<5} | {'Dewarped Image':<25} | {'Scan GT':<12} | {'CER':<8} | {'ED':<7} | {'Time (s)':<8}")
-	print('-' * 85)
 
 	cer_list, ed_list, time_list = [], [], []
 	records = []
@@ -150,12 +155,25 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 		return (idx, p_name, s_name, cer, ed, elapsed)
 
 	indexed_items = list(enumerate(valid_pairs, 1))
+	results = []
 
-	if num_workers > 1:
-		with ThreadPoolExecutor(max_workers=num_workers) as executor:
-			results = list(executor.map(process_dewarped_page, indexed_items))
-	else:
-		results = [process_dewarped_page(item) for item in indexed_items]
+	with tqdm(total=total, desc=f"OCR Tesseract [{benchmark_name}]", unit="img", ncols=95) as pbar:
+		if num_workers > 1:
+			with ThreadPoolExecutor(max_workers=num_workers) as executor:
+				futures = [executor.submit(process_dewarped_page, item) for item in indexed_items]
+				for fut in futures:
+					res = fut.result()
+					results.append(res)
+					pbar.update(1)
+					current_cers = [r[3] for r in results]
+					pbar.set_postfix({'CER': f"{np.mean(current_cers):.4f}"})
+		else:
+			for item in indexed_items:
+				res = process_dewarped_page(item)
+				results.append(res)
+				pbar.update(1)
+				current_cers = [r[3] for r in results]
+				pbar.set_postfix({'CER': f"{np.mean(current_cers):.4f}"})
 
 	results.sort(key=lambda x: x[0])
 	for idx, p_name, s_name, cer, ed, elapsed in results:
@@ -163,7 +181,6 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 		ed_list.append(ed)
 		time_list.append(elapsed)
 		records.append([idx, p_name, s_name, f"{cer:.4f}", ed, f"{elapsed:.2f}"])
-		print(f"{idx:<5} | {p_name:<25} | {s_name:<12} | {cer:<8.4f} | {ed:<7} | {elapsed:<8.2f}")
 
 	mean_cer = float(np.mean(cer_list))
 	mean_ed = float(np.mean(ed_list))

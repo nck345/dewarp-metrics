@@ -397,7 +397,7 @@ void Matrix::readMatrix(const mxArray* prhs)
 	int nElements = mxGetNumberOfDimensions(prhs);
 	if(nElements>2)
 		mexErrMsgTxt("A matrix is expected to be loaded!");
-	const int* dims = mxGetDimensions(prhs);
+	const mwSize* dims = mxGetDimensions(prhs);
 	allocate(dims[0],dims[1]);
 	double* data = (double*)mxGetData(prhs);
 	for(int i =0; i<nRow; i++)
@@ -407,7 +407,7 @@ void Matrix::readMatrix(const mxArray* prhs)
 
 void Matrix::writeMatrix(mxArray*& plhs) const
 {
-	int dims[2];
+	mwSize dims[2];
 	dims[0]=nRow;dims[1]=nCol;
 	plhs=mxCreateNumericArray(2, dims,mxDOUBLE_CLASS, mxREAL);
 	double* data = (double *)mxGetData(plhs);

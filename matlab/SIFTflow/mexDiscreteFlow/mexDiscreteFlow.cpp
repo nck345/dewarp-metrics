@@ -5,7 +5,7 @@
 
 double* outputMatrix2(mxArray*& plhs,int n1,int n2)
 {
-	int dims[2];
+	mwSize dims[2];
 	dims[0]=n1;
 	dims[1]=n2;
 	plhs=mxCreateNumericArray(2,dims,mxDOUBLE_CLASS,mxREAL);
@@ -14,7 +14,7 @@ double* outputMatrix2(mxArray*& plhs,int n1,int n2)
 
 double* outputMatrix3(mxArray*& plhs,int n1,int n2,int n3)
 {
-	int dims[3];
+	mwSize dims[3];
 	dims[0]=n1;
 	dims[1]=n2;
 	dims[2]=n3;
@@ -24,7 +24,7 @@ double* outputMatrix3(mxArray*& plhs,int n1,int n2,int n3)
 
 double* outputMatrix4(mxArray*& plhs,int n1,int n2,int n3,int n4)
 {
-	int dims[4];
+	mwSize dims[4];
 	dims[0]=n1;
 	dims[1]=n2;
 	dims[2]=n3;
@@ -55,10 +55,10 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         int nDims=mxGetNumberOfDimensions(prhs[2]);
 		if(nDims>2)
 			mexErrMsgTxt("The third parameter must be a vector!");
-		const int* dims=mxGetDimensions(prhs[2]);
+		const mwSize* dims=mxGetDimensions(prhs[2]);
 		if(dims[0]!=1 && dims[1]!=1)
 			mexErrMsgTxt("The third parameter must be a vector!");
-		int nPara=dims[0]+dims[1]-1;
+		int nPara=(int)(dims[0]+dims[1]-1);
         double* para=(double *)mxGetData(prhs[2]);
 
         if(nPara>=1)

@@ -219,13 +219,7 @@ for i = 1:num_pairs
     results_cell{i, 5} = ld_val;
     results_cell{i, 6} = img_time;
 
-    if skip_ms
-        fprintf('%-5d | %-25s | %-12s | %-8.2f | %-8.2f\n', ...
-                i, pair.pred_name, pair.scan_name, ld_val, img_time);
-    else
-        fprintf('%-5d | %-25s | %-12s | %-9.4f | %-8.2f | %-8.2f\n', ...
-                i, pair.pred_name, pair.scan_name, ms_val, ld_val, img_time);
-    end
+    fprintf('PROGRESS_DONE: %s | LD-M: %.4f\n', pair.pred_name, ld_val);
     fflush(stdout);
 end
 
