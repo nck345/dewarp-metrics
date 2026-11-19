@@ -76,7 +76,7 @@ python run_eval.py \
   --ms_ssim_backend "torch" \
   --workers 2
 ```
-Use `--benchmarks all` to evaluate all benchmarks. A master summary table is printed and saved to `eval_reports/<Model>_ALL_BENCHMARKS_SUMMARY.csv`.
+Use `--benchmarks all` to evaluate all benchmarks. Results are automatically saved to `eval_reports/<Model>_summary.csv` and appended to the consolidated leaderboard `eval_reports/benchmark_summary.csv`. By default, only clean aggregate benchmark summaries are saved (use `--save_details` if per-image rows are ever needed).
 
 Available arguments:
 - `--benchmark`: Subset to evaluate:
@@ -91,3 +91,4 @@ Available arguments:
 - `--ocr_cache_json`: Path to JSON cache for ground truth scan OCR texts.
 - `--skip_image`: Skip MS-SSIM-M and LD-M.
 - `--skip_ocr`: Skip CER and ED.
+- `--save_details`: Save detailed per-image rows (default: False, only benchmark summary is saved).
