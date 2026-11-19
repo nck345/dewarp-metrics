@@ -224,10 +224,102 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 
 	return report_df
 
+def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
+                        octave_bin='octave', ms_ssim_backend='torch',
+                        num_workers=2, use_local_ssd=True,
+                        skip_image=False, skip_ocr=False):
+	all_supported = ['docunet_paper_subset', 'docunet_130', 'dir300', 'docreal']
+	if benchmarks is None or benchmarks == 'all' or (isinstance(benchmarks, (list, tuple)) and 'all' in benchmarks):
+		target_bms = all_supported
+	elif isinstance(benchmarks, str):
+		target_bms = [benchmarks]
+	else:
+		target_bms = list(benchmarks)
+
+	print('=' * 95)
+	print(f'=== RUNNING BENCHMARK SUITE FOR MODEL [{model_name.upper()}] ===')
+	print(f'Total Benchmarks : {len(target_bms)} ({", ".join(target_bms)})')
+	print(f'Base Directory   : {base_dir}')
+	print('=' * 95)
+
+	suite_summaries = []
+	t_start = time.time()
+
+	for idx, bm in enumerate(target_bms, 1):
+		print('\n' + '#' * 95)
+		print(f'# [{idx}/{len(target_bms)}] EVALUATING BENCHMARK: {bm.upper()}')
+		print('#' * 95)
+
+		gt_dir = os.path.join(base_dir, 'benchmarks', bm, 'scan')
+		if not os.path.exists(gt_dir) and bm in ['docunet_paper_subset', 'docunet_130']:
+			gt_dir = os.path.join(base_dir, 'data_benchmark', 'scan', 'scan')
+
+		pred_dir = os.path.join(base_dir, 'predictions', model_name, bm)
+		if not os.path.exists(pred_dir) and bm in ['docunet_paper_subset', 'docunet_130']:
+			pred_dir = os.path.join(base_dir, 'predictions', model_name)
+
+		if not os.path.exists(gt_dir):
+			print(f'Warning: Ground truth directory not found for {bm}: {gt_dir}. Skipping.')
+			continue
+		if not os.path.exists(pred_dir):
+			print(f'Warning: Predictions directory not found for {bm}: {pred_dir}. Skipping.')
+			continue
+
+		report_dir = os.path.join(base_dir, 'eval_reports')
+		os.makedirs(report_dir, exist_ok=True)
+		save_csv = os.path.join(report_dir, f'{model_name}_{bm}_metrics.csv')
+
+		cache_dir = os.path.join(base_dir, 'gt_cache')
+		os.makedirs(cache_dir, exist_ok=True)
+		ocr_cache_json = os.path.join(cache_dir, f'{bm}_tesseract_cache.json')
+
+		df_rep = run_evaluation(
+			pred_dir=pred_dir,
+			gt_dir=gt_dir,
+			model_name=model_name,
+			benchmark=bm,
+			output_csv=save_csv,
+			ocr_cache_json=ocr_cache_json,
+			octave_bin=octave_bin,
+			ms_ssim_backend=ms_ssim_backend,
+			num_workers=num_workers,
+			use_local_ssd=use_local_ssd,
+			skip_image=skip_image,
+			skip_ocr=skip_ocr
+		)
+
+		if df_rep is not None and not df_rep.empty:
+			summary_row = df_rep[df_rep['Index'] == 'SUMMARY']
+			if not summary_row.empty:
+				s_dict = summary_row.iloc[0].to_dict()
+				s_dict['Benchmark'] = bm
+				suite_summaries.append(s_dict)
+
+	if suite_summaries:
+		master_df = pd.DataFrame(suite_summaries)
+		cols_order = ['Benchmark', 'Model', 'Dewarped_Image', 'MS_SSIM_M', 'LD_M', 'CER', 'ED', 'Time_seconds']
+		avail_cols = [c for c in cols_order if c in master_df.columns]
+		other_cols = [c for c in master_df.columns if c not in cols_order and c != 'Index']
+		master_df = master_df[avail_cols + other_cols]
+
+		master_csv = os.path.join(base_dir, 'eval_reports', f'{model_name}_ALL_BENCHMARKS_SUMMARY.csv')
+		master_df.to_csv(master_csv, index=False, encoding='utf-8')
+
+		print('\n' + '=' * 95)
+		print(f'=== MASTER SUITE SUMMARY FOR [{model_name.upper()}] ({time.time() - t_start:.1f}s) ===')
+		print(master_df.to_string(index=False))
+		print(f'\n✅ Master suite summary saved to: {master_csv}')
+		print('=' * 95)
+		return master_df
+
+	return None
+
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Dewarp-Metrics: Standard Benchmark Evaluation Pipeline')
-	parser.add_argument('--pred_dir', type=str, required=True, help='Directory of dewarped images')
-	parser.add_argument('--gt_dir', type=str, required=True, help='Directory of ground truth scan images')
+	parser.add_argument('--base_dir', type=str, default=None, help='Base directory of Document_Dewarp_Benchmark')
+	parser.add_argument('--benchmarks', nargs='+', default=None, help='List of benchmarks to evaluate, or all')
+	parser.add_argument('--pred_dir', type=str, default=None, help='Directory of dewarped images')
+	parser.add_argument('--gt_dir', type=str, default=None, help='Directory of ground truth scan images')
 	parser.add_argument('--model_name', type=str, default='Model', help='Name of the evaluated model')
 	parser.add_argument('--benchmark', type=str, default='docunet_paper_subset',
 	                    choices=['docunet_paper_subset', 'docunet_paper_70', 'docunet_130', 'dir300', 'docreal', 'all'])
@@ -242,17 +334,32 @@ if __name__ == '__main__':
 	parser.add_argument('--skip_ocr', action='store_true', help='Skip OCR metrics (CER & ED)')
 	args = parser.parse_args()
 
-	run_evaluation(
-		pred_dir=args.pred_dir,
-		gt_dir=args.gt_dir,
-		model_name=args.model_name,
-		benchmark=args.benchmark,
-		output_csv=args.output_csv,
-		ocr_cache_json=args.ocr_cache_json,
-		octave_bin=args.octave_bin,
-		ms_ssim_backend=args.ms_ssim_backend,
-		num_workers=args.workers,
-		use_local_ssd=not args.no_ssd_cache,
-		skip_image=args.skip_image,
-		skip_ocr=args.skip_ocr
-	)
+	if args.base_dir:
+		run_benchmark_suite(
+			base_dir=args.base_dir,
+			model_name=args.model_name,
+			benchmarks=args.benchmarks if args.benchmarks else args.benchmark,
+			octave_bin=args.octave_bin,
+			ms_ssim_backend=args.ms_ssim_backend,
+			num_workers=args.workers,
+			use_local_ssd=not args.no_ssd_cache,
+			skip_image=args.skip_image,
+			skip_ocr=args.skip_ocr
+		)
+	else:
+		if not args.pred_dir or not args.gt_dir:
+			parser.error("Either --base_dir or both --pred_dir and --gt_dir must be provided.")
+		run_evaluation(
+			pred_dir=args.pred_dir,
+			gt_dir=args.gt_dir,
+			model_name=args.model_name,
+			benchmark=args.benchmark,
+			output_csv=args.output_csv,
+			ocr_cache_json=args.ocr_cache_json,
+			octave_bin=args.octave_bin,
+			ms_ssim_backend=args.ms_ssim_backend,
+			num_workers=args.workers,
+			use_local_ssd=not args.no_ssd_cache,
+			skip_image=args.skip_image,
+			skip_ocr=args.skip_ocr
+		)
