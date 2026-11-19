@@ -8,6 +8,11 @@ MEX_FLOW="$SCRIPT_DIR/matlab/SIFTflow/mexDiscreteFlow"
 
 echo "=== Compiling SIFT Flow MEX for GNU Octave ==="
 
+if ! command -v mkoctfile &> /dev/null; then
+    echo "Installing octave-dev for mkoctfile..."
+    apt-get update -qq && apt-get install -y octave-dev -qq || true
+fi
+
 echo "1/2 Compiling mexDenseSIFT..."
 cd "$MEX_DENSE"
 mkoctfile -O3 --mex mexDenseSIFT.cpp Matrix.cpp Vector.cpp -o mexDenseSIFT.mex

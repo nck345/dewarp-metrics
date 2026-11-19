@@ -23,7 +23,7 @@ def sync_to_local_ssd(src_dir, dst_dir):
 def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_paper_subset',
                    output_csv=None, ocr_cache_json=None, octave_bin='octave',
                    ms_ssim_backend='torch', num_workers=2, use_local_ssd=True,
-                   skip_image=False, skip_ocr=False):
+                   skip_image=False, skip_ocr=False, save_details=False, **kwargs):
 	repo_root = os.path.dirname(os.path.abspath(__file__))
 	matlab_dir = os.path.join(repo_root, 'matlab')
 
