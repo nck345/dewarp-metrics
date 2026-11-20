@@ -22,6 +22,43 @@ def sync_to_local_ssd(src_dir, dst_dir):
 			shutil.copy2(s_path, d_path)
 	return dst_dir
 
+def ensure_octave_mex(repo_root, matlab_dir, octave_bin='octave'):
+	"""Verifies SIFT Flow MEX binaries can be loaded and executed by Octave; auto-compiles if missing."""
+	check_script = (
+		f"addpath('{matlab_dir.replace('\\', '/')}'); "
+		f"addpath('{os.path.join(matlab_dir, 'SIFTflow').replace('\\', '/')}'); "
+		f"addpath('{os.path.join(matlab_dir, 'SIFTflow', 'mexDenseSIFT').replace('\\', '/')}'); "
+		f"addpath('{os.path.join(matlab_dir, 'SIFTflow', 'mexDiscreteFlow').replace('\\', '/')}'); "
+		"if (exist('mexDenseSIFT') != 3 && exist('mexDenseSIFT') != 103) || "
+		"   (exist('mexDiscreteFlow') != 3 && exist('mexDiscreteFlow') != 103), "
+		"  exit(1); "
+		"end; "
+		"exit(0);"
+	)
+	try:
+		res = subprocess.run([octave_bin, '--no-gui', '--silent', '--eval', check_script],
+		                     capture_output=True, text=True, timeout=15)
+		if res.returncode == 0:
+			return True
+	except Exception:
+		pass
+
+	compile_sh = os.path.join(repo_root, 'compile_mex.sh')
+	if os.path.exists(compile_sh):
+		print("⚙️ SIFT Flow MEX binaries missing or outdated for GNU Octave. Auto-compiling via compile_mex.sh...")
+		try:
+			comp_res = subprocess.run(['bash', compile_sh], cwd=repo_root, capture_output=True, text=True)
+			if comp_res.returncode == 0:
+				print("✅ Auto-compilation of SIFT Flow MEX succeeded!")
+				return True
+			else:
+				print("❌ Auto-compilation failed:")
+				print(comp_res.stderr or comp_res.stdout)
+		except Exception as e:
+			print(f"❌ Could not run compile_mex.sh: {e}")
+
+	return False
+
 def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_paper_subset',
                    output_csv=None, ocr_cache_json=None, octave_bin='octave',
                    ms_ssim_backend='torch', num_workers=2, use_local_ssd=True,
@@ -119,73 +156,82 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 		skip_octave_ms = (ms_ssim_backend == 'torch')
 		step_name = '2/3' if ms_ssim_backend == 'torch' else '1/2'
 		print(f'\n>>> [Step {step_name}] Computing LD-M via GNU Octave SIFT Flow ({num_workers} parallel workers)...')
-		t_ldm_start = time.time()
 
-		pbar_ldm = tqdm(total=len(valid_pairs), desc=f"LD-M Octave [{benchmark}]", unit="img", ncols=95)
-		pbar_lock = threading.Lock()
-
-		def run_octave_worker(part_idx):
-			with tempfile.NamedTemporaryFile(suffix=f'_image_part{part_idx}.csv', delete=False) as tmp:
-				part_csv = tmp.name
-
-			oct_pred = work_pred_dir.replace('\\', '/')
-			oct_gt = work_gt_dir.replace('\\', '/')
-			oct_out = part_csv.replace('\\', '/')
-			skip_ms_arg = 'true' if skip_octave_ms else 'false'
-
-			matlab_script = (
-				f"addpath('{matlab_dir.replace('\\', '/')}'); "
-				f"run_eval_octave('{oct_pred}', '{oct_gt}', '{oct_out}', '{benchmark}', {part_idx}, {num_workers}, {skip_ms_arg}); "
-				f"exit;"
-			)
-
-			octave_cmd = [octave_bin, '--no-gui', '--silent', '--eval', matlab_script]
-			err_lines = []
-			try:
-				proc = subprocess.Popen(
-					octave_cmd,
-					stdout=subprocess.PIPE,
-					stderr=subprocess.STDOUT,
-					text=True,
-					bufsize=1
-				)
-				for line in proc.stdout:
-					if 'PROGRESS_DONE:' in line:
-						with pbar_lock:
-							pbar_ldm.update(1)
-					else:
-						err_lines.append(line)
-				proc.wait()
-				if proc.returncode != 0:
-					print(f"❌ Error in Octave worker {part_idx} (exit code {proc.returncode}):")
-					for l in err_lines[-15:]:
-						print(f"   {l.strip()}")
-				if os.path.exists(part_csv):
-					df = pd.read_csv(part_csv)
-					df = df[df['Index'] != 'SUMMARY'].copy()
-					try:
-						os.remove(part_csv)
-					except Exception:
-						pass
-					return df
-			except Exception as e:
-				print(f"❌ Error in Octave worker {part_idx}: {e}")
-			return pd.DataFrame()
-
-		if num_workers > 1:
-			with ThreadPoolExecutor(max_workers=num_workers) as executor:
-				part_dfs = list(executor.map(run_octave_worker, range(1, num_workers + 1)))
-			valid_dfs = [df for df in part_dfs if not df.empty]
-			if valid_dfs:
-				df_ldm = pd.concat(valid_dfs, ignore_index=True)
-				df_ldm = df_ldm.sort_values(by=['Dewarped_Image']).reset_index(drop=True)
+		if not ensure_octave_mex(repo_root, matlab_dir, octave_bin):
+			print("⚠️ CẢNH BÁO: Không thể tải hoặc biên dịch SIFT Flow MEX cho GNU Octave. Bỏ qua đo LD-M.")
 		else:
-			df_ldm = run_octave_worker(1)
+			t_ldm_start = time.time()
+			pbar_ldm = tqdm(total=len(valid_pairs), desc=f"LD-M Octave [{benchmark}]", unit="img", ncols=95)
+			pbar_lock = threading.Lock()
 
-		pbar_ldm.close()
-		t_ldm_total = time.time() - t_ldm_start
-		if df_ldm is not None and not df_ldm.empty:
-			print(f'✅ LD-M Octave Complete! Mean: {df_ldm["LD_M"].mean():.2f} in {t_ldm_total:.2f}s')
+			def run_octave_worker(part_idx):
+				with tempfile.NamedTemporaryFile(suffix=f'_image_part{part_idx}.csv', delete=False) as tmp:
+					part_csv = tmp.name
+
+				oct_pred = work_pred_dir.replace('\\', '/')
+				oct_gt = work_gt_dir.replace('\\', '/')
+				oct_out = part_csv.replace('\\', '/')
+				skip_ms_arg = 'true' if skip_octave_ms else 'false'
+
+				matlab_script = (
+					f"addpath('{matlab_dir.replace('\\', '/')}'); "
+					f"run_eval_octave('{oct_pred}', '{oct_gt}', '{oct_out}', '{benchmark}', {part_idx}, {num_workers}, {skip_ms_arg}); "
+					f"exit;"
+				)
+
+				octave_cmd = [octave_bin, '--no-gui', '--silent', '--eval', matlab_script]
+				err_lines = []
+				try:
+					proc = subprocess.Popen(
+						octave_cmd,
+						stdout=subprocess.PIPE,
+						stderr=subprocess.STDOUT,
+						text=True,
+						bufsize=1
+					)
+					for line in proc.stdout:
+						if 'PROGRESS_DONE:' in line:
+							with pbar_lock:
+								pbar_ldm.update(1)
+						else:
+							err_lines.append(line)
+					proc.wait()
+					if proc.returncode != 0:
+						print(f"❌ Error in Octave worker {part_idx} (exit code {proc.returncode}):")
+						for l in err_lines[-15:]:
+							print(f"   {l.strip()}")
+						if os.path.exists(part_csv):
+							try:
+								os.remove(part_csv)
+							except Exception:
+								pass
+						return pd.DataFrame()
+					if os.path.exists(part_csv):
+						try:
+							df = pd.read_csv(part_csv)
+							df = df[df['Index'] != 'SUMMARY'].copy()
+							os.remove(part_csv)
+							return df
+						except Exception as e:
+							print(f"❌ Error reading Octave worker {part_idx} CSV: {e}")
+				except Exception as e:
+					print(f"❌ Error in Octave worker {part_idx}: {e}")
+				return pd.DataFrame()
+
+			if num_workers > 1:
+				with ThreadPoolExecutor(max_workers=num_workers) as executor:
+					part_dfs = list(executor.map(run_octave_worker, range(1, num_workers + 1)))
+				valid_dfs = [df for df in part_dfs if not df.empty]
+				if valid_dfs:
+					df_ldm = pd.concat(valid_dfs, ignore_index=True)
+					df_ldm = df_ldm.sort_values(by=['Dewarped_Image']).reset_index(drop=True)
+			else:
+				df_ldm = run_octave_worker(1)
+
+			pbar_ldm.close()
+			t_ldm_total = time.time() - t_ldm_start
+			if df_ldm is not None and not df_ldm.empty:
+				print(f'✅ LD-M Octave Complete! Mean: {df_ldm["LD_M"].mean():.2f} in {t_ldm_total:.2f}s')
 
 	# 3. TEXT METRICS EVALUATION (TESSERACT 5.0)
 	if not skip_ocr:
@@ -298,9 +344,18 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 			try:
 				df_cached = pd.read_csv(bm_sum_csv)
 				if not df_cached.empty and 'Images' in df_cached.columns:
-					print(f'⚡ [RESUME] Đã tìm thấy báo cáo đã đo cho [{model_name.upper()}] trên [{bm.upper()}]. Bỏ qua đo lại.')
-					suite_summaries.append(df_cached)
-					continue
+					is_complete = True
+					if not skip_image and ('LD_M' not in df_cached.columns or pd.isna(df_cached['LD_M'].iloc[0])):
+						is_complete = False
+					if not skip_ocr and ('CER' not in df_cached.columns or pd.isna(df_cached['CER'].iloc[0])):
+						is_complete = False
+
+					if is_complete:
+						print(f'⚡ [RESUME] Đã tìm thấy báo cáo hoàn tất cho [{model_name.upper()}] trên [{bm.upper()}]. Bỏ qua đo lại.')
+						suite_summaries.append(df_cached)
+						continue
+					else:
+						print(f'🔄 [RESUME] Báo cáo trước đó của [{model_name.upper()}] trên [{bm.upper()}] bị thiếu chỉ số (LD-M hoặc OCR). Tiến hành đo lại...')
 			except Exception:
 				pass
 
