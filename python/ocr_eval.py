@@ -8,7 +8,16 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image
 from tqdm.auto import tqdm
-import pytesseract
+
+try:
+	import pytesseract
+except ImportError:
+	try:
+		import sys, subprocess
+		subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "pytesseract"])
+		import pytesseract
+	except Exception:
+		pytesseract = None
 
 os.environ["OMP_THREAD_LIMIT"] = "1"
 
@@ -17,13 +26,20 @@ try:
 	def levenshtein_dist(s1, s2):
 		return rf_lev.distance(s1, s2)
 except ImportError:
-	def levenshtein_dist(str1, str2):
-		matrix = [[i + j for j in range(len(str2) + 1)] for i in range(len(str1) + 1)]
-		for i in range(1, len(str1) + 1):
-			for j in range(1, len(str2) + 1):
-				d = 0 if str1[i - 1] == str2[j - 1] else 1
-				matrix[i][j] = min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + d)
-		return matrix[len(str1)][len(str2)]
+	try:
+		import sys, subprocess
+		subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "rapidfuzz"])
+		import rapidfuzz.distance.Levenshtein as rf_lev
+		def levenshtein_dist(s1, s2):
+			return rf_lev.distance(s1, s2)
+	except Exception:
+		def levenshtein_dist(str1, str2):
+			matrix = [[i + j for j in range(len(str2) + 1)] for i in range(len(str1) + 1)]
+			for i in range(1, len(str1) + 1):
+				for j in range(1, len(str2) + 1):
+					d = 0 if str1[i - 1] == str2[j - 1] else 1
+					matrix[i][j] = min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + d)
+			return matrix[len(str1)][len(str2)]
 
 PAPER_SUBSET_IDS = {
 	'1', '2', '3', '4', '5', '6', '7', '9', '10', '21',
@@ -45,6 +61,21 @@ def extract_doc_id(filename):
 	return digits if digits else ''.join(filter(str.isdigit, base))
 
 def run_tesseract_ocr(img_path, max_retries=3):
+	global pytesseract
+	if pytesseract is None:
+		try:
+			import pytesseract as pt
+			pytesseract = pt
+		except ImportError:
+			try:
+				import sys, subprocess
+				subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "pytesseract"])
+				import pytesseract as pt
+				pytesseract = pt
+			except Exception as err:
+				print(f"Warning: pytesseract could not be imported/installed: {err}")
+				return ''
+
 	for attempt in range(1, max_retries + 1):
 		try:
 			return pytesseract.image_to_string(img_path)
