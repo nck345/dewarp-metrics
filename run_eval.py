@@ -258,8 +258,12 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 
 def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
                         octave_bin='octave', ms_ssim_backend='torch',
-                        num_workers=2, use_local_ssd=True,
-                        skip_image=False, skip_ocr=False, save_details=False):
+                        num_workers=None, use_local_ssd=True,
+                        skip_image=False, skip_ocr=False, save_details=True,
+                        resume=True):
+	if num_workers is None or num_workers < 1:
+		num_workers = min(4, os.cpu_count() or 2)
+
 	all_supported = ['docunet_paper_subset', 'docunet_130', 'dir300', 'docreal']
 	if benchmarks is None or benchmarks == 'all' or (isinstance(benchmarks, (list, tuple)) and 'all' in benchmarks):
 		target_bms = all_supported
@@ -268,10 +272,15 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 	else:
 		target_bms = list(benchmarks)
 
+	report_dir = os.path.join(base_dir, 'eval_reports')
+	os.makedirs(report_dir, exist_ok=True)
+
 	print('=' * 95)
 	print(f'=== RUNNING BENCHMARK SUITE FOR MODEL [{model_name.upper()}] ===')
 	print(f'Total Benchmarks : {len(target_bms)} ({", ".join(target_bms)})')
 	print(f'Base Directory   : {base_dir}')
+	print(f'Parallel Workers : {num_workers} workers')
+	print(f'Resume mode      : {resume}')
 	print('=' * 95)
 
 	suite_summaries = []
@@ -281,6 +290,19 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 		print('\n' + '#' * 95)
 		print(f'# [{idx}/{len(target_bms)}] EVALUATING BENCHMARK: {bm.upper()}')
 		print('#' * 95)
+
+		bm_sum_csv = os.path.join(report_dir, f'{model_name}_{bm}_summary.csv')
+		detail_csv = os.path.join(report_dir, f'{model_name}_{bm}_details.csv')
+
+		if resume and os.path.exists(bm_sum_csv):
+			try:
+				df_cached = pd.read_csv(bm_sum_csv)
+				if not df_cached.empty and 'Images' in df_cached.columns:
+					print(f'⚡ [RESUME] Đã tìm thấy báo cáo đã đo cho [{model_name.upper()}] trên [{bm.upper()}]. Bỏ qua đo lại.')
+					suite_summaries.append(df_cached)
+					continue
+			except Exception:
+				pass
 
 		gt_dir = os.path.join(base_dir, 'benchmarks', bm, 'scan')
 		if not os.path.exists(gt_dir) and bm in ['docunet_paper_subset', 'docunet_130']:
@@ -301,14 +323,14 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 		os.makedirs(cache_dir, exist_ok=True)
 		ocr_cache_json = os.path.join(cache_dir, f'{bm}_tesseract_cache.json')
 
-		detail_csv = os.path.join(base_dir, 'eval_reports', f'{model_name}_{bm}_details.csv') if save_details else None
+		target_output_csv = detail_csv if save_details else bm_sum_csv
 
 		df_sum = run_evaluation(
 			pred_dir=pred_dir,
 			gt_dir=gt_dir,
 			model_name=model_name,
 			benchmark=bm,
-			output_csv=detail_csv,
+			output_csv=target_output_csv,
 			ocr_cache_json=ocr_cache_json,
 			octave_bin=octave_bin,
 			ms_ssim_backend=ms_ssim_backend,
@@ -320,7 +342,21 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 		)
 
 		if df_sum is not None and not df_sum.empty:
+			df_sum.to_csv(bm_sum_csv, index=False, encoding='utf-8')
 			suite_summaries.append(df_sum)
+
+			# Incremental update of consolidated benchmark_summary.csv
+			all_summary_csv = os.path.join(report_dir, 'benchmark_summary.csv')
+			if os.path.exists(all_summary_csv):
+				try:
+					cur_master = pd.read_csv(all_summary_csv)
+					cur_master = cur_master[~((cur_master['Model'] == model_name) & (cur_master['Benchmark'] == bm))]
+					cur_master = pd.concat([cur_master, df_sum], ignore_index=True)
+				except Exception:
+					cur_master = df_sum
+			else:
+				cur_master = df_sum
+			cur_master.to_csv(all_summary_csv, index=False, encoding='utf-8')
 
 	if suite_summaries:
 		master_df = pd.concat(suite_summaries, ignore_index=True)

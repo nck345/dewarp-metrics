@@ -16,10 +16,12 @@ fi
 echo "1/2 Compiling mexDenseSIFT..."
 cd "$MEX_DENSE"
 mkoctfile -O3 --mex -fpermissive mexDenseSIFT.cpp Matrix.cpp Vector.cpp -o mexDenseSIFT.mex
+cp -f mexDenseSIFT.mex "$SCRIPT_DIR/matlab/SIFTflow/" 2>/dev/null || true
 
 echo "2/2 Compiling mexDiscreteFlow..."
 cd "$MEX_FLOW"
 mkoctfile -O3 --mex -fpermissive mexDiscreteFlow.cpp BPFlow.cpp Stochastic.cpp -o mexDiscreteFlow.mex
+cp -f mexDiscreteFlow.mex "$SCRIPT_DIR/matlab/SIFTflow/" 2>/dev/null || true
 
 cd "$SCRIPT_DIR"
 echo "✅ Compilation completed successfully! MEX files are ready in matlab/SIFTflow/"

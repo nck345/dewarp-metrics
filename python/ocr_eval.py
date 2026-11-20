@@ -7,6 +7,9 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image
 from tqdm.auto import tqdm
+import pytesseract
+
+os.environ["OMP_THREAD_LIMIT"] = "1"
 
 try:
 	import rapidfuzz.distance.Levenshtein as rf_lev
@@ -41,13 +44,15 @@ def extract_doc_id(filename):
 	return digits if digits else ''.join(filter(str.isdigit, base))
 
 def run_tesseract_ocr(img_path):
-	import pytesseract
 	try:
-		img = Image.open(img_path)
-		return pytesseract.image_to_string(img)
-	except Exception as e:
-		print(f"Warning: Tesseract failed on {img_path}: {e}")
-		return ''
+		return pytesseract.image_to_string(img_path)
+	except Exception:
+		try:
+			with Image.open(img_path) as img:
+				return pytesseract.image_to_string(img)
+		except Exception as e:
+			print(f"Warning: Tesseract failed on {img_path}: {e}")
+			return ''
 
 def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_name='docunet_paper_subset',
                  num_workers=2):

@@ -50,11 +50,18 @@ if exist('OCTAVE_VERSION', 'builtin')
     more off;
 end
 
-% Check MEX binaries (3 = mex, 103 = oct)
-if exist('mexDenseSIFT') ~= 3 && exist('mexDenseSIFT') ~= 103
+% Check MEX binaries (robust check across MATLAB & GNU Octave)
+sift_dir = fullfile(cur_dir, 'SIFTflow', 'mexDenseSIFT');
+flow_dir = fullfile(cur_dir, 'SIFTflow', 'mexDiscreteFlow');
+has_dense = (exist('mexDenseSIFT') == 3 || exist('mexDenseSIFT') == 103 || exist('mexDenseSIFT') == 2 || ...
+             ~isempty(which('mexDenseSIFT')) || ~isempty(dir(fullfile(sift_dir, 'mexDenseSIFT.mex*'))));
+has_flow = (exist('mexDiscreteFlow') == 3 || exist('mexDiscreteFlow') == 103 || exist('mexDiscreteFlow') == 2 || ...
+            ~isempty(which('mexDiscreteFlow')) || ~isempty(dir(fullfile(flow_dir, 'mexDiscreteFlow.mex*'))));
+
+if ~has_dense
     error('mexDenseSIFT MEX binary not found! Please run compile_mex script first.');
 end
-if exist('mexDiscreteFlow') ~= 3 && exist('mexDiscreteFlow') ~= 103
+if ~has_flow
     error('mexDiscreteFlow MEX binary not found! Please run compile_mex script first.');
 end
 
