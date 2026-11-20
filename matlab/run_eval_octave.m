@@ -202,7 +202,11 @@ for i = 1:num_pairs
     ref_msk(m1) = 0;
 
     % Setup on-disk SIFT cache directory for cross-worker & cross-model acceleration
-    disk_sift_dir = fullfile(fileparts(gt_dir), 'sift_cache');
+    if exist('/content', 'dir')
+        disk_sift_dir = '/content/benchmark_cache/sift_cache';
+    else
+        disk_sift_dir = fullfile(fileparts(gt_dir), 'sift_cache');
+    end
     if ~exist(disk_sift_dir, 'dir')
         try
             mkdir(disk_sift_dir);
@@ -213,36 +217,54 @@ for i = 1:num_pairs
     % Check in-memory then on-disk scan SIFT descriptor cache
     scan_key = ['scan_', regexprep(pair.scan_name, '[^a-zA-Z0-9]', '_')];
     disk_mat_file = fullfile(disk_sift_dir, [scan_key, '.mat']);
+    sift2_c = [];
+    im2_c = [];
+    pyrd2_c = [];
 
     if isfield(scan_sift_cache, scan_key)
         sift2_c = scan_sift_cache.(scan_key).sift2;
         im2_c = scan_sift_cache.(scan_key).im2;
+        if isfield(scan_sift_cache.(scan_key), 'pyrd2')
+            pyrd2_c = scan_sift_cache.(scan_key).pyrd2;
+        end
     elseif exist(disk_mat_file, 'file')
         try
             loaded = load(disk_mat_file);
             sift2_c = loaded.sift2;
             im2_c = loaded.im2;
+            if isfield(loaded, 'pyrd2')
+                pyrd2_c = loaded.pyrd2;
+            end
+            f_names = fieldnames(scan_sift_cache);
+            if length(f_names) >= 2
+                scan_sift_cache = struct();
+            end
             scan_sift_cache.(scan_key).sift2 = sift2_c;
             scan_sift_cache.(scan_key).im2 = im2_c;
+            scan_sift_cache.(scan_key).pyrd2 = pyrd2_c;
         catch
             sift2_c = [];
             im2_c = [];
+            pyrd2_c = [];
         end
-    else
-        sift2_c = [];
-        im2_c = [];
     end
 
-    [ms_val, ld_val, sift2_out, im2_out] = evalUnwarp(A1, ref, ref_msk, sift2_c, im2_c, skip_ms);
+    [ms_val, ld_val, sift2_out, im2_out, pyrd2_out] = evalUnwarp(A1, ref, ref_msk, sift2_c, im2_c, skip_ms, pyrd2_c);
 
     if isempty(sift2_c)
+        f_names = fieldnames(scan_sift_cache);
+        if length(f_names) >= 2
+            scan_sift_cache = struct();
+        end
         scan_sift_cache.(scan_key).sift2 = sift2_out;
         scan_sift_cache.(scan_key).im2 = im2_out;
+        scan_sift_cache.(scan_key).pyrd2 = pyrd2_out;
         if ~exist(disk_mat_file, 'file')
             try
                 sift2 = sift2_out;
                 im2 = im2_out;
-                save(disk_mat_file, 'sift2', 'im2');
+                pyrd2 = pyrd2_out;
+                save(disk_mat_file, 'sift2', 'im2', 'pyrd2', '-v7');
             catch
             end
         end

@@ -34,7 +34,7 @@ cd "$SCRIPT_DIR"
 
 if command -v octave &> /dev/null; then
     echo "Verifying MEX binaries and multi-channel imfilter in GNU Octave..."
-    octave --no-gui --silent --eval "addpath('$SCRIPT_DIR/matlab'); addpath('$SCRIPT_DIR/matlab/SIFTflow'); addpath('$MEX_DENSE'); addpath('$MEX_FLOW'); s = mexDenseSIFT(zeros(10,10,'double'), 3, 1); test_f = imfilter(zeros(4,4,128,'uint8'), [1 2 1; 2 4 2; 1 2 1]/16, 'same', 'replicate'); disp('✅ Octave runtime verification successful: mexDenseSIFT and multi-channel imfilter are working!');"
+    octave --no-gui --silent --eval "try, pkg load image; catch, end; addpath('$SCRIPT_DIR/matlab', '-begin'); addpath('$SCRIPT_DIR/matlab/SIFTflow', '-begin'); addpath('$MEX_DENSE', '-begin'); addpath('$MEX_FLOW', '-begin'); s = mexDenseSIFT(zeros(10,10,'double'), 3, 1); test_f = imfilter(zeros(4,4,128,'uint8'), [1 2 1; 2 4 2; 1 2 1]/16, 'same', 'replicate'); disp('✅ Octave runtime verification successful: mexDenseSIFT and multi-channel imfilter are working!');"
 fi
 
 echo "✅ Compilation completed successfully! MEX files are ready in matlab/SIFTflow/"

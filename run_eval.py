@@ -30,10 +30,11 @@ def ensure_octave_mex(repo_root, matlab_dir, octave_bin='octave'):
 
 	def verify_runtime():
 		test_script = (
-			f"addpath('{matlab_dir.replace('\\', '/')}'); "
-			f"addpath('{sift_dir.replace('\\', '/')}'); "
-			f"addpath('{dense_dir.replace('\\', '/')}'); "
-			f"addpath('{flow_dir.replace('\\', '/')}'); "
+			"try, pkg load image; catch, end; "
+			f"addpath('{matlab_dir.replace('\\', '/')}', '-begin'); "
+			f"addpath('{sift_dir.replace('\\', '/')}', '-begin'); "
+			f"addpath('{dense_dir.replace('\\', '/')}', '-begin'); "
+			f"addpath('{flow_dir.replace('\\', '/')}', '-begin'); "
 			"try, "
 			"  s = mexDenseSIFT(zeros(2,2,'double'), 3, 1); "
 			"  f = imfilter(zeros(4,4,128,'uint8'), [1 2 1; 2 4 2; 1 2 1]/16, 'same', 'replicate'); "
