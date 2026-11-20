@@ -9,8 +9,13 @@ MEX_FLOW="$SCRIPT_DIR/matlab/SIFTflow/mexDiscreteFlow"
 echo "=== Compiling SIFT Flow MEX for GNU Octave ==="
 
 if ! command -v mkoctfile &> /dev/null; then
-    echo "Installing octave-dev for mkoctfile..."
-    apt-get update -qq && apt-get install -y octave-dev -qq || true
+    echo "Installing octave development packages (octave-dev liboctave-dev) for mkoctfile..."
+    apt-get update -qq && apt-get install -y octave-dev liboctave-dev -qq || true
+fi
+
+if ! command -v mkoctfile &> /dev/null; then
+    echo "❌ Error: mkoctfile not found! Please install octave-dev or liboctave-dev."
+    exit 1
 fi
 
 echo "1/2 Compiling mexDenseSIFT..."

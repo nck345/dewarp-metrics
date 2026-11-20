@@ -24,35 +24,44 @@ def sync_to_local_ssd(src_dir, dst_dir):
 
 def ensure_octave_mex(repo_root, matlab_dir, octave_bin='octave'):
 	"""Verifies SIFT Flow MEX binaries can be loaded and executed by Octave; auto-compiles if missing."""
-	check_script = (
-		f"addpath('{matlab_dir.replace('\\', '/')}'); "
-		f"addpath('{os.path.join(matlab_dir, 'SIFTflow').replace('\\', '/')}'); "
-		f"addpath('{os.path.join(matlab_dir, 'SIFTflow', 'mexDenseSIFT').replace('\\', '/')}'); "
-		f"addpath('{os.path.join(matlab_dir, 'SIFTflow', 'mexDiscreteFlow').replace('\\', '/')}'); "
-		"if (exist('mexDenseSIFT') != 3 && exist('mexDenseSIFT') != 103) || "
-		"   (exist('mexDiscreteFlow') != 3 && exist('mexDiscreteFlow') != 103), "
-		"  exit(1); "
-		"end; "
-		"exit(0);"
-	)
-	try:
-		res = subprocess.run([octave_bin, '--no-gui', '--silent', '--eval', check_script],
-		                     capture_output=True, text=True, timeout=15)
-		if res.returncode == 0:
-			return True
-	except Exception:
-		pass
+	sift_dir = os.path.join(matlab_dir, 'SIFTflow')
+	dense_dir = os.path.join(sift_dir, 'mexDenseSIFT')
+	flow_dir = os.path.join(sift_dir, 'mexDiscreteFlow')
+
+	def verify_runtime():
+		test_script = (
+			f"addpath('{matlab_dir.replace('\\', '/')}'); "
+			f"addpath('{sift_dir.replace('\\', '/')}'); "
+			f"addpath('{dense_dir.replace('\\', '/')}'); "
+			f"addpath('{flow_dir.replace('\\', '/')}'); "
+			"try, "
+			"  s = mexDenseSIFT(zeros(2,2,'double'), 3, 1); "
+			"  if (exist('mexDiscreteFlow') != 3 && exist('mexDiscreteFlow') != 103), exit(1); end; "
+			"  exit(0); "
+			"catch, "
+			"  exit(1); "
+			"end;"
+		)
+		try:
+			res = subprocess.run([octave_bin, '--no-gui', '--silent', '--eval', test_script],
+			                     capture_output=True, text=True, timeout=15)
+			return res.returncode == 0
+		except Exception:
+			return False
+
+	if verify_runtime():
+		return True
 
 	compile_sh = os.path.join(repo_root, 'compile_mex.sh')
 	if os.path.exists(compile_sh):
-		print("⚙️ SIFT Flow MEX binaries missing or outdated for GNU Octave. Auto-compiling via compile_mex.sh...")
+		print("⚙️ SIFT Flow MEX binaries missing or uncallable in GNU Octave. Auto-compiling via compile_mex.sh...")
 		try:
 			comp_res = subprocess.run(['bash', compile_sh], cwd=repo_root, capture_output=True, text=True)
-			if comp_res.returncode == 0:
-				print("✅ Auto-compilation of SIFT Flow MEX succeeded!")
+			if comp_res.returncode == 0 and verify_runtime():
+				print("✅ Auto-compilation and verification of SIFT Flow MEX succeeded!")
 				return True
 			else:
-				print("❌ Auto-compilation failed:")
+				print("❌ Auto-compilation or verification failed:")
 				print(comp_res.stderr or comp_res.stdout)
 		except Exception as e:
 			print(f"❌ Could not run compile_mex.sh: {e}")
@@ -345,8 +354,11 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 				df_cached = pd.read_csv(bm_sum_csv)
 				if not df_cached.empty and 'Images' in df_cached.columns:
 					is_complete = True
-					if not skip_image and ('LD_M' not in df_cached.columns or pd.isna(df_cached['LD_M'].iloc[0])):
-						is_complete = False
+					if not skip_image:
+						if 'MS_SSIM_M' not in df_cached.columns or pd.isna(df_cached['MS_SSIM_M'].iloc[0]):
+							is_complete = False
+						if 'LD_M' not in df_cached.columns or pd.isna(df_cached['LD_M'].iloc[0]):
+							is_complete = False
 					if not skip_ocr and ('CER' not in df_cached.columns or pd.isna(df_cached['CER'].iloc[0])):
 						is_complete = False
 

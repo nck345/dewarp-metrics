@@ -18,7 +18,9 @@ mex mexDiscreteFlow.cpp BPFlow.cpp Stochastic.cpp
 cur_ext = ['.' mexext];
 try
     copyfile(fullfile(mex_dense_dir, ['mexDenseSIFT' cur_ext]), fullfile(cur_dir, 'matlab', 'SIFTflow'));
+    copyfile(fullfile(mex_dense_dir, ['mexDenseSIFT' cur_ext]), fullfile(cur_dir, 'matlab'));
     copyfile(fullfile(mex_flow_dir, ['mexDiscreteFlow' cur_ext]), fullfile(cur_dir, 'matlab', 'SIFTflow'));
+    copyfile(fullfile(mex_flow_dir, ['mexDiscreteFlow' cur_ext]), fullfile(cur_dir, 'matlab'));
 catch
 end
 

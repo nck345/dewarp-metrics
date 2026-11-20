@@ -50,15 +50,22 @@ if exist('OCTAVE_VERSION', 'builtin')
     more off;
 end
 
-% Check MEX binaries (robust check across MATLAB & GNU Octave)
-has_dense = (exist('mexDenseSIFT') == 3 || exist('mexDenseSIFT') == 103 || ~isempty(which('mexDenseSIFT')));
-has_flow = (exist('mexDiscreteFlow') == 3 || exist('mexDiscreteFlow') == 103 || ~isempty(which('mexDiscreteFlow')));
+% Check MEX binaries (robust execution test across MATLAB & GNU Octave)
+has_dense = false;
+try
+    mexDenseSIFT(zeros(2, 2, 'double'), 3, 1);
+    has_dense = true;
+catch
+    has_dense = (exist('mexDenseSIFT') == 3 || exist('mexDenseSIFT') == 103);
+end
+
+has_flow = (exist('mexDiscreteFlow') == 3 || exist('mexDiscreteFlow') == 103);
 
 if ~has_dense
-    error('mexDenseSIFT MEX binary not found or not loadable! Please run compile_mex script first.');
+    error('mexDenseSIFT MEX binary not found or not callable! Please run compile_mex.sh first.');
 end
 if ~has_flow
-    error('mexDiscreteFlow MEX binary not found or not loadable! Please run compile_mex script first.');
+    error('mexDiscreteFlow MEX binary not found or not callable! Please run compile_mex.sh first.');
 end
 
 paper_ids = {'1', '2', '3', '4', '5', '6', '7', '9', '10', '21', ...

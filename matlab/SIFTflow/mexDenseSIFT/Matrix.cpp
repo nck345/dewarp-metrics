@@ -38,7 +38,7 @@ Matrix::~Matrix(void)
 void Matrix::releaseData()
 {
 	if(pData!=NULL)
-		delete pData;
+		delete []pData;
 	pData=NULL;
 	nRow=nCol=0;
 }
@@ -393,7 +393,7 @@ bool Matrix::readMatrix(QFile &file)
 void Matrix::readMatrix(const mxArray* prhs)
 {
 	if(pData!=NULL)
-		delete pData;
+		delete []pData;
 	int nElements = mxGetNumberOfDimensions(prhs);
 	if(nElements>2)
 		mexErrMsgTxt("A matrix is expected to be loaded!");

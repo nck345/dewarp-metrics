@@ -35,7 +35,7 @@ Vector::~Vector(void)
 void Vector::releaseData()
 {
 	if(pData!=NULL)
-		delete pData;
+		delete []pData;
 	pData=NULL;
 	nDim=0;
 }
@@ -264,7 +264,7 @@ bool Vector::readVector(QFile &file)
 void Vector::readVector(const mxArray* prhs)
 {
 	if(pData!=NULL)
-		delete pData;
+		delete []pData;
 	int nElements = mxGetNumberOfDimensions(prhs);
 	if(nElements>2)
 		mexErrMsgTxt("A vector is expected to be loaded!");
