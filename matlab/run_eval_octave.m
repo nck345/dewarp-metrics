@@ -34,14 +34,7 @@ if ischar(skip_ms)
     skip_ms = strcmpi(skip_ms, 'true') || strcmp(skip_ms, '1');
 end
 
-% Setup paths
-cur_dir = fileparts(mfilename('fullpath'));
-addpath(cur_dir);
-addpath(fullfile(cur_dir, 'SIFTflow'));
-addpath(fullfile(cur_dir, 'SIFTflow', 'mexDenseSIFT'));
-addpath(fullfile(cur_dir, 'SIFTflow', 'mexDiscreteFlow'));
-
-% Octave image package load
+% Octave image package load first so our custom imfilter takes precedence
 if exist('OCTAVE_VERSION', 'builtin')
     try
         pkg load image;
@@ -49,6 +42,13 @@ if exist('OCTAVE_VERSION', 'builtin')
     end
     more off;
 end
+
+% Setup paths with highest precedence (-begin)
+cur_dir = fileparts(mfilename('fullpath'));
+addpath(cur_dir, '-begin');
+addpath(fullfile(cur_dir, 'SIFTflow'), '-begin');
+addpath(fullfile(cur_dir, 'SIFTflow', 'mexDenseSIFT'), '-begin');
+addpath(fullfile(cur_dir, 'SIFTflow', 'mexDiscreteFlow'), '-begin');
 
 % Check MEX binaries (robust execution test across MATLAB & GNU Octave)
 has_dense = false;
@@ -134,13 +134,15 @@ for k = 1:length(pred_list)
 end
 
 if total_parts > 1
-    my_pairs = {};
-    for k = 1:length(valid_pairs)
-        if mod(k - 1, total_parts) + 1 == part_idx
-            my_pairs{end+1} = valid_pairs{k};
-        end
+    num_total = length(valid_pairs);
+    chunk_size = ceil(num_total / total_parts);
+    start_idx = (part_idx - 1) * chunk_size + 1;
+    end_idx = min(part_idx * chunk_size, num_total);
+    if start_idx <= num_total
+        valid_pairs = valid_pairs(start_idx:end_idx);
+    else
+        valid_pairs = {};
     end
-    valid_pairs = my_pairs;
 end
 
 num_pairs = length(valid_pairs);
@@ -199,11 +201,33 @@ for i = 1:num_pairs
     m1 = (A1 == 0);
     ref_msk(m1) = 0;
 
-    % Check in-memory scan SIFT descriptor cache
+    % Setup on-disk SIFT cache directory for cross-worker & cross-model acceleration
+    disk_sift_dir = fullfile(fileparts(gt_dir), 'sift_cache');
+    if ~exist(disk_sift_dir, 'dir')
+        try
+            mkdir(disk_sift_dir);
+        catch
+        end
+    end
+
+    % Check in-memory then on-disk scan SIFT descriptor cache
     scan_key = ['scan_', regexprep(pair.scan_name, '[^a-zA-Z0-9]', '_')];
+    disk_mat_file = fullfile(disk_sift_dir, [scan_key, '.mat']);
+
     if isfield(scan_sift_cache, scan_key)
         sift2_c = scan_sift_cache.(scan_key).sift2;
         im2_c = scan_sift_cache.(scan_key).im2;
+    elseif exist(disk_mat_file, 'file')
+        try
+            loaded = load(disk_mat_file);
+            sift2_c = loaded.sift2;
+            im2_c = loaded.im2;
+            scan_sift_cache.(scan_key).sift2 = sift2_c;
+            scan_sift_cache.(scan_key).im2 = im2_c;
+        catch
+            sift2_c = [];
+            im2_c = [];
+        end
     else
         sift2_c = [];
         im2_c = [];
@@ -214,6 +238,14 @@ for i = 1:num_pairs
     if isempty(sift2_c)
         scan_sift_cache.(scan_key).sift2 = sift2_out;
         scan_sift_cache.(scan_key).im2 = im2_out;
+        if ~exist(disk_mat_file, 'file')
+            try
+                sift2 = sift2_out;
+                im2 = im2_out;
+                save(disk_mat_file, 'sift2', 'im2');
+            catch
+            end
+        end
     end
 
     img_time = toc(t_img_start);

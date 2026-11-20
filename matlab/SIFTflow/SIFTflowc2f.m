@@ -66,9 +66,20 @@ if IsSegmentation
     pyrd(1).seg=Segmentation;
 end
 
+h_gauss = fspecial('gaussian', 5, 0.67);
 for i=2:nlevels
-    pyrd(i).im1=imresize(imfilter(pyrd(i-1).im1,fspecial('gaussian',5,0.67),'same','replicate'),0.5,'bicubic');
-    pyrd(i).im2=imresize(imfilter(pyrd(i-1).im2,fspecial('gaussian',5,0.67),'same','replicate'),0.5,'bicubic');
+    try
+        filt1 = imfilter(pyrd(i-1).im1, h_gauss, 'same', 'replicate');
+    catch
+        filt1 = filter_channels_replicate(pyrd(i-1).im1, h_gauss);
+    end
+    try
+        filt2 = imfilter(pyrd(i-1).im2, h_gauss, 'same', 'replicate');
+    catch
+        filt2 = filter_channels_replicate(pyrd(i-1).im2, h_gauss);
+    end
+    pyrd(i).im1 = imresize(filt1, 0.5, 'bicubic');
+    pyrd(i).im2 = imresize(filt2, 0.5, 'bicubic');
 %     pyrd(i).im1 = reduceImage(pyrd(i-1).im1);
 %     pyrd(i).im2 = reduceImage(pyrd(i-1).im2);
     if IsSegmentation
@@ -176,5 +187,49 @@ Min=min(foo(:));
 Max=max(foo(:));
 winSizeIm=wsize*(foo-Min)/(Max-Min)+wsize;
 
+end
 
+function out = filter_channels_replicate(im, h)
+% Robust multi-channel filtering with replicate padding for GNU Octave & MATLAB
+orig_class = class(im);
+is_uint8 = strcmp(orig_class, 'uint8');
+[rows, cols, channels] = size(im);
+[frows, fcols] = size(h);
+pr = floor(frows / 2);
+pc = floor(fcols / 2);
+r_idx = [ones(1, pr), 1:rows, rows * ones(1, pr)];
+c_idx = [ones(1, pc), 1:cols, cols * ones(1, pc)];
+im_pad = im(r_idx, c_idx, :);
+
+[U, S, V] = svd(double(h));
+if S(2, 2) / S(1, 1) < 1e-5
+    g_col = U(:, 1) * sqrt(S(1, 1));
+    g_row = V(:, 1)' * sqrt(S(1, 1));
+    if sum(g_col) < 0, g_col = -g_col; g_row = -g_row; end
+    g_col = double(g_col(end:-1:1));
+    g_row = double(g_row(end:-1:1))';
+    out = zeros(rows, cols, channels, orig_class);
+    for c = 1:channels
+        slice = double(im_pad(:,:,c));
+        f_slice = conv2(g_col, g_row, slice, 'valid');
+        if is_uint8
+            out(:,:,c) = uint8(round(f_slice));
+        else
+            out(:,:,c) = cast(f_slice, orig_class);
+        end
+    end
+else
+    h_rot = double(rot90(h, 2));
+    out = zeros(rows, cols, channels, orig_class);
+    for c = 1:channels
+        slice = double(im_pad(:,:,c));
+        f_slice = conv2(slice, h_rot, 'valid');
+        if is_uint8
+            out(:,:,c) = uint8(round(f_slice));
+        else
+            out(:,:,c) = cast(f_slice, orig_class);
+        end
+    end
+end
+end
 

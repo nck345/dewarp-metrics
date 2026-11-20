@@ -36,6 +36,7 @@ def ensure_octave_mex(repo_root, matlab_dir, octave_bin='octave'):
 			f"addpath('{flow_dir.replace('\\', '/')}'); "
 			"try, "
 			"  s = mexDenseSIFT(zeros(2,2,'double'), 3, 1); "
+			"  f = imfilter(zeros(4,4,128,'uint8'), [1 2 1; 2 4 2; 1 2 1]/16, 'same', 'replicate'); "
 			"  if (exist('mexDiscreteFlow') != 3 && exist('mexDiscreteFlow') != 103), exit(1); end; "
 			"  exit(0); "
 			"catch, "
@@ -183,7 +184,7 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 				skip_ms_arg = 'true' if skip_octave_ms else 'false'
 
 				matlab_script = (
-					f"addpath('{matlab_dir.replace('\\', '/')}'); "
+					f"addpath('{matlab_dir.replace('\\', '/')}', '-begin'); "
 					f"run_eval_octave('{oct_pred}', '{oct_gt}', '{oct_out}', '{benchmark}', {part_idx}, {num_workers}, {skip_ms_arg}); "
 					f"exit;"
 				)
