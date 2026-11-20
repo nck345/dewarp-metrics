@@ -13,16 +13,27 @@ if [ "$(id -u)" -ne 0 ] && command -v sudo &> /dev/null; then
     SUDO="sudo"
 fi
 
-if ! command -v mkoctfile &> /dev/null; then
-    echo "Installing octave development package (octave-dev) for mkoctfile..."
-    $SUDO apt-get update -qq || true
-    $SUDO apt-get install -y octave-dev -qq || $SUDO apt-get install -y liboctave-dev -qq || true
+# Clean up broken repositories like r2u if present to avoid apt-get update failure
+if [ -d "/etc/apt/sources.list.d" ]; then
+    $SUDO rm -f /etc/apt/sources.list.d/*r2u* 2>/dev/null || true
 fi
 
 if ! command -v mkoctfile &> /dev/null; then
-    if [ -x "/usr/bin/mkoctfile" ]; then
-        export PATH="/usr/bin:$PATH"
-    fi
+    echo "Installing octave development package (octave-dev) for mkoctfile..."
+    $SUDO apt-get update -qq || true
+    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y --no-install-recommends octave octave-dev octave-image -qq || \
+    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y octave octave-dev -qq || \
+    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y octave-dev -qq || \
+    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y liboctave-dev -qq || true
+fi
+
+if ! command -v mkoctfile &> /dev/null; then
+    for cand in /usr/bin/mkoctfile /usr/local/bin/mkoctfile /usr/lib/octave/*/mkoctfile; do
+        if [ -x "$cand" ]; then
+            export PATH="$(dirname "$cand"):$PATH"
+            break
+        fi
+    done
 fi
 
 if ! command -v mkoctfile &> /dev/null; then
@@ -32,15 +43,21 @@ fi
 
 echo "1/2 Compiling mexDenseSIFT..."
 cd "$MEX_DENSE"
-mkoctfile -O3 -march=native -funroll-loops --mex -fpermissive mexDenseSIFT.cpp Matrix.cpp Vector.cpp -o mexDenseSIFT.mex
-cp -f mexDenseSIFT.mex "$SCRIPT_DIR/matlab/SIFTflow/" 2>/dev/null || true
-cp -f mexDenseSIFT.mex "$SCRIPT_DIR/matlab/" 2>/dev/null || true
+if ! mkoctfile -O3 -march=native -funroll-loops --mex -fpermissive mexDenseSIFT.cpp Matrix.cpp Vector.cpp -o mexDenseSIFT.mex; then
+    echo "Retrying mexDenseSIFT without -march=native..."
+    mkoctfile -O3 -funroll-loops --mex -fpermissive mexDenseSIFT.cpp Matrix.cpp Vector.cpp -o mexDenseSIFT.mex
+fi
+cp -f mexDenseSIFT.* "$SCRIPT_DIR/matlab/SIFTflow/" 2>/dev/null || true
+cp -f mexDenseSIFT.* "$SCRIPT_DIR/matlab/" 2>/dev/null || true
 
 echo "2/2 Compiling mexDiscreteFlow..."
 cd "$MEX_FLOW"
-mkoctfile -O3 -march=native -funroll-loops --mex -fpermissive mexDiscreteFlow.cpp BPFlow.cpp Stochastic.cpp -o mexDiscreteFlow.mex
-cp -f mexDiscreteFlow.mex "$SCRIPT_DIR/matlab/SIFTflow/" 2>/dev/null || true
-cp -f mexDiscreteFlow.mex "$SCRIPT_DIR/matlab/" 2>/dev/null || true
+if ! mkoctfile -O3 -march=native -funroll-loops --mex -fpermissive mexDiscreteFlow.cpp BPFlow.cpp Stochastic.cpp -o mexDiscreteFlow.mex; then
+    echo "Retrying mexDiscreteFlow without -march=native..."
+    mkoctfile -O3 -funroll-loops --mex -fpermissive mexDiscreteFlow.cpp BPFlow.cpp Stochastic.cpp -o mexDiscreteFlow.mex
+fi
+cp -f mexDiscreteFlow.* "$SCRIPT_DIR/matlab/SIFTflow/" 2>/dev/null || true
+cp -f mexDiscreteFlow.* "$SCRIPT_DIR/matlab/" 2>/dev/null || true
 
 cd "$SCRIPT_DIR"
 

@@ -3,6 +3,7 @@ import json
 import time
 import argparse
 import csv
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from PIL import Image
@@ -43,16 +44,30 @@ def extract_doc_id(filename):
 	digits = ''.join(filter(str.isdigit, prefix))
 	return digits if digits else ''.join(filter(str.isdigit, base))
 
-def run_tesseract_ocr(img_path):
-	try:
-		return pytesseract.image_to_string(img_path)
-	except Exception:
+def run_tesseract_ocr(img_path, max_retries=3):
+	for attempt in range(1, max_retries + 1):
 		try:
-			with Image.open(img_path) as img:
-				return pytesseract.image_to_string(img)
+			return pytesseract.image_to_string(img_path)
 		except Exception as e:
-			print(f"Warning: Tesseract failed on {img_path}: {e}")
-			return ''
+			err_str = str(e).lower()
+			if getattr(e, 'errno', None) == 107 or '107' in err_str or 'transport endpoint' in err_str:
+				try:
+					from google.colab import drive
+					subprocess.run(['fusermount', '-u', '-z', '/content/drive'], capture_output=True)
+					drive.mount('/content/drive', force_remount=True)
+				except Exception:
+					pass
+				time.sleep(1.0 * (2 ** (attempt - 1)))
+			else:
+				try:
+					with Image.open(img_path) as img:
+						return pytesseract.image_to_string(img)
+				except Exception as inner_e:
+					if attempt == max_retries:
+						print(f"Warning: Tesseract failed on {img_path}: {inner_e}")
+						return ''
+					time.sleep(0.5)
+	return ''
 
 def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_name='docunet_paper_subset',
                  num_workers=2):
@@ -75,6 +90,7 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 			if getattr(e, 'errno', None) == 107 or '107' in err_str or 'transport endpoint' in err_str:
 				try:
 					from google.colab import drive
+					subprocess.run(['fusermount', '-u', '-z', '/content/drive'], capture_output=True)
 					drive.mount('/content/drive', force_remount=True)
 				except Exception:
 					pass

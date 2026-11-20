@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image
 import time
 import os
+import subprocess
 
 class HighPrecisionMSSSIM(torch.nn.Module):
 	"""
@@ -94,6 +95,7 @@ def safe_open_image(path, mode='L', max_retries=3):
 			if getattr(e, 'errno', None) == 107 or '107' in err_str or 'transport endpoint' in err_str:
 				try:
 					from google.colab import drive
+					subprocess.run(['fusermount', '-u', '-z', '/content/drive'], capture_output=True)
 					drive.mount('/content/drive', force_remount=True)
 				except Exception:
 					pass

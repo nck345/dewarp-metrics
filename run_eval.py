@@ -12,27 +12,40 @@ from tqdm.auto import tqdm
 from python.ocr_eval import evaluate_ocr, extract_doc_id, PAPER_SUBSET_IDS, PAPER_70_IDS
 from python.ms_ssim_torch import HighPrecisionMSSSIM, evaluate_ms_ssim_pair
 
+_drive_remount_lock = threading.Lock()
+
 def remount_google_drive(mount_point='/content/drive', max_retries=3, delay=2.0):
 	"""Attempts to remount Google Drive in Colab if transport endpoint is disconnected."""
-	try:
-		from google.colab import drive
-		print(f"⚠️ Transport endpoint disconnected. Attempting to remount Google Drive at {mount_point}...")
-		for attempt in range(1, max_retries + 1):
-			try:
-				drive.mount(mount_point, force_remount=True)
-				time.sleep(delay)
-				if os.path.exists(mount_point):
-					print("✅ Successfully remounted Google Drive!")
-					return True
-			except Exception as ex:
-				print(f"   Remount attempt {attempt}/{max_retries} failed: {ex}")
-				if attempt < max_retries:
-					time.sleep(delay * (2 ** (attempt - 1)))
-	except ImportError:
-		pass
-	except Exception as e:
-		print(f"⚠️ Unexpected error while remounting drive: {e}")
-	return False
+	with _drive_remount_lock:
+		my_drive = os.path.join(mount_point, 'MyDrive')
+		if os.path.exists(my_drive):
+			return True
+
+		try:
+			from google.colab import drive
+			print(f"⚠️ Transport endpoint disconnected. Attempting to remount Google Drive at {mount_point}...")
+			for attempt in range(1, max_retries + 1):
+				try:
+					subprocess.run(['fusermount', '-u', '-z', mount_point], capture_output=True)
+					subprocess.run(['umount', '-l', mount_point], capture_output=True)
+				except Exception:
+					pass
+
+				try:
+					drive.mount(mount_point, force_remount=True)
+					time.sleep(delay)
+					if os.path.exists(my_drive):
+						print("✅ Successfully remounted Google Drive!")
+						return True
+				except Exception as ex:
+					print(f"   Remount attempt {attempt}/{max_retries} failed: {ex}")
+					if attempt < max_retries:
+						time.sleep(delay * (2 ** (attempt - 1)))
+		except ImportError:
+			pass
+		except Exception as e:
+			print(f"⚠️ Unexpected error while remounting drive: {e}")
+		return False
 
 def is_endpoint_error(err):
 	"""Checks if an exception is Errno 107 (Transport endpoint is not connected)."""
@@ -42,19 +55,23 @@ def is_endpoint_error(err):
 	err_str = str(err).lower()
 	return '107' in err_str or 'transport endpoint' in err_str or 'endpoint is not connected' in err_str
 
-def copy_file_with_retry(s_path, d_path, max_retries=3, base_delay=1.0):
+def copy_file_with_retry(s_path, d_path, max_retries=5, base_delay=0.5):
 	"""Copies a single file with retry logic, exponential backoff, and drive remount on Errno 107."""
 	for attempt in range(1, max_retries + 1):
-		tmp_d_path = f"{d_path}.tmp_{os.getpid()}"
+		tmp_d_path = f"{d_path}.tmp_{os.getpid()}_{attempt}"
 		try:
-			if not os.path.exists(s_path) and '/content/drive' in s_path:
+			if '/content/drive' in s_path and not os.path.exists('/content/drive/MyDrive'):
 				remount_google_drive()
 
 			src_size = os.path.getsize(s_path)
 			if os.path.exists(d_path) and os.path.getsize(d_path) == src_size and src_size > 0:
 				return True
 
-			shutil.copy2(s_path, tmp_d_path)
+			time.sleep(0.01)
+
+			with open(s_path, 'rb') as fsrc, open(tmp_d_path, 'wb') as fdst:
+				shutil.copyfileobj(fsrc, fdst, length=4 * 1024 * 1024)
+
 			if os.path.exists(tmp_d_path) and os.path.getsize(tmp_d_path) == src_size:
 				os.replace(tmp_d_path, d_path)
 				return True
@@ -92,11 +109,11 @@ def copy_file_with_retry(s_path, d_path, max_retries=3, base_delay=1.0):
 			return False
 	return False
 
-def sync_to_local_ssd(src_dir, dst_dir, max_retries=3):
+def sync_to_local_ssd(src_dir, dst_dir, max_retries=5):
 	"""
 	Syncs images from src_dir (e.g. Google Drive) to local SSD (dst_dir).
 	Resilient to FUSE transport endpoint disconnects (Errno 107) with automatic
-	remounting, exponential backoff, and graceful fallback to src_dir if copying fails.
+	remounting, exponential backoff, progress indication, and multi-pass retry.
 	"""
 	if not os.path.exists(src_dir):
 		if '/content/drive' in src_dir:
@@ -134,17 +151,44 @@ def sync_to_local_ssd(src_dir, dst_dir, max_retries=3):
 	if not img_files:
 		return src_dir
 
-	copy_failed = False
+	to_copy = []
 	for f in img_files:
 		s_path = os.path.join(src_dir, f)
 		d_path = os.path.join(dst_dir, f)
-		if not copy_file_with_retry(s_path, d_path, max_retries=max_retries):
-			print(f"⚠️ Failed to copy {f} to local SSD. Falling back to reading directly from {src_dir}.")
-			copy_failed = True
-			break
+		try:
+			if not (os.path.exists(d_path) and os.path.getsize(d_path) == os.path.getsize(s_path) and os.path.getsize(s_path) > 0):
+				to_copy.append(f)
+		except OSError:
+			to_copy.append(f)
 
-	if copy_failed:
-		return src_dir
+	if not to_copy:
+		return dst_dir
+
+	bm_name = os.path.basename(dst_dir)
+	failed_files = []
+	with tqdm(total=len(to_copy), desc=f"Syncing SSD [{bm_name}]", unit="img", ncols=95) as pbar:
+		for f in to_copy:
+			s_path = os.path.join(src_dir, f)
+			d_path = os.path.join(dst_dir, f)
+			if not copy_file_with_retry(s_path, d_path, max_retries=max_retries):
+				failed_files.append(f)
+			pbar.update(1)
+
+	if failed_files:
+		print(f"⚠️ {len(failed_files)}/{len(to_copy)} files failed initial sync. Remounting drive for second pass...")
+		remount_google_drive()
+		still_failed = []
+		for f in failed_files:
+			s_path = os.path.join(src_dir, f)
+			d_path = os.path.join(dst_dir, f)
+			if not copy_file_with_retry(s_path, d_path, max_retries=max_retries):
+				still_failed.append(f)
+		failed_files = still_failed
+
+	if failed_files:
+		print(f"⚠️ {len(failed_files)} files could not be synced to SSD. Direct drive reading will be used as fallback.")
+		if len(failed_files) >= len(img_files):
+			return src_dir
 
 	return dst_dir
 
@@ -167,6 +211,12 @@ def safe_to_csv(df, path, max_retries=3, **kwargs):
 
 def ensure_octave_mex(repo_root, matlab_dir, octave_bin='octave'):
 	"""Verifies SIFT Flow MEX binaries can be loaded and executed by Octave; auto-compiles if missing."""
+	if shutil.which(octave_bin) is None:
+		for cand in ['/usr/bin/octave', '/usr/local/bin/octave']:
+			if os.path.exists(cand):
+				octave_bin = cand
+				break
+
 	sift_dir = os.path.join(matlab_dir, 'SIFTflow')
 	dense_dir = os.path.join(sift_dir, 'mexDenseSIFT')
 	flow_dir = os.path.join(sift_dir, 'mexDiscreteFlow')
@@ -202,6 +252,11 @@ def ensure_octave_mex(repo_root, matlab_dir, octave_bin='octave'):
 		print("⚙️ SIFT Flow MEX binaries missing or uncallable in GNU Octave. Auto-compiling via compile_mex.sh...")
 		try:
 			comp_res = subprocess.run(['bash', compile_sh], cwd=repo_root, capture_output=True, text=True)
+			if shutil.which(octave_bin) is None:
+				for cand in ['/usr/bin/octave', '/usr/local/bin/octave']:
+					if os.path.exists(cand):
+						octave_bin = cand
+						break
 			if comp_res.returncode == 0 and verify_runtime():
 				print("✅ Auto-compilation and verification of SIFT Flow MEX succeeded!")
 				return True
@@ -226,6 +281,12 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 	pred_dir = os.path.abspath(pred_dir)
 	gt_dir = os.path.abspath(gt_dir)
 
+	if shutil.which(octave_bin) is None:
+		for cand in ['/usr/bin/octave', '/usr/local/bin/octave']:
+			if os.path.exists(cand):
+				octave_bin = cand
+				break
+
 	print('=' * 95)
 	print('=== DEWARP-METRICS UNIVERSAL BENCHMARK EVALUATOR ===')
 	print(f'Model Name        : {model_name}')
@@ -247,9 +308,8 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 		if work_pred_dir != pred_dir and work_gt_dir != gt_dir:
 			print('✅ Local SSD sync complete!')
 		else:
-			print('⚠️ Local SSD sync encountered issues; falling back to direct drive reading.')
+			print('⚠️ Local SSD sync encountered issues; fallback paths active.')
 
-	# Build paired list
 	img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.PNG', '.JPG', '.JPEG')
 	try:
 		all_pred = [f for f in os.listdir(work_pred_dir) if f.endswith(img_exts)]
@@ -437,7 +497,13 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 
 	# 4. MERGE AND SAVE RESULTS
 	print('\n>>> Merging evaluation results...')
-	base_df = pd.DataFrame(valid_pairs, columns=['Dewarped_Image', 'Pred_Path', 'Scan_GT', 'Scan_Path'])
+	base_df = pd.DataFrame({
+		'Index': range(1, len(valid_pairs) + 1),
+		'Model': model_name,
+		'Benchmark': benchmark,
+		'Dewarped_Image': [p[0] for p in valid_pairs],
+		'Scan_GT': [p[2] for p in valid_pairs]
+	})
 
 	if df_ms_ssim is not None and not df_ms_ssim.empty:
 		base_df = pd.merge(base_df, df_ms_ssim[['Dewarped_Image', 'Scan_GT', 'MS_SSIM_M', 'Time_ssim']], on=['Dewarped_Image', 'Scan_GT'], how='left')
@@ -452,7 +518,7 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 
 	# Summary row
 	n_samples = len(valid_pairs)
-	summary_dict = {'Model': model_name, 'Benchmark': benchmark, 'Images': n_samples}
+	summary_dict = {'Index': 'SUMMARY', 'Model': model_name, 'Benchmark': benchmark, 'Images': n_samples}
 
 	for col in ['MS_SSIM_M', 'LD_M', 'CER', 'ED']:
 		if col in base_df.columns:
@@ -463,19 +529,21 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 	print('\n' + '=' * 85)
 	print(f'=== FINAL BENCHMARK SUMMARY FOR [{model_name.upper()}] ON [{benchmark.upper()}] ===')
 	for col, val in summary_dict.items():
-		print(f'- {col:<15}: {val}')
+		if col != 'Index':
+			print(f'- {col:<15}: {val}')
 	print('=' * 85)
 
+	summary_only = summary_df.drop(columns=['Index'], errors='ignore')
 	if output_csv:
 		if save_details:
 			detail_df = pd.concat([base_df, summary_df], ignore_index=True)
 			safe_to_csv(detail_df, output_csv, index=False, encoding='utf-8')
 			print(f'\nDetailed report saved to: {output_csv}')
 		else:
-			safe_to_csv(summary_df, output_csv, index=False, encoding='utf-8')
+			safe_to_csv(summary_only, output_csv, index=False, encoding='utf-8')
 			print(f'\nSummary report saved to: {output_csv}')
 
-	return summary_df
+	return summary_only
 
 def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
                         octave_bin='octave', ms_ssim_backend='torch',
@@ -534,6 +602,13 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 						continue
 					else:
 						print(f'🔄 [RESUME] Báo cáo trước đó của [{model_name.upper()}] trên [{bm.upper()}] bị thiếu chỉ số (LD-M hoặc OCR). Tiến hành đo lại...')
+			except OSError as e:
+				if is_endpoint_error(e):
+					remount_google_drive()
+					try:
+						df_cached = pd.read_csv(bm_sum_csv)
+					except Exception:
+						df_cached = None
 			except Exception:
 				pass
 
