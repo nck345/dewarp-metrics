@@ -4,6 +4,8 @@ import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
 import numpy as np
 from PIL import Image
+import time
+import os
 
 class HighPrecisionMSSSIM(torch.nn.Module):
 	"""
@@ -82,6 +84,27 @@ class HighPrecisionMSSSIM(torch.nn.Module):
 		ms = (self.weights * ss).sum()
 		return float(ms.item())
 
+def safe_open_image(path, mode='L', max_retries=3):
+	for attempt in range(1, max_retries + 1):
+		try:
+			with Image.open(path) as img:
+				return img.convert(mode)
+		except OSError as e:
+			err_str = str(e).lower()
+			if getattr(e, 'errno', None) == 107 or '107' in err_str or 'transport endpoint' in err_str:
+				try:
+					from google.colab import drive
+					drive.mount('/content/drive', force_remount=True)
+				except Exception:
+					pass
+				time.sleep(1.0 * (2 ** (attempt - 1)))
+			else:
+				if attempt == max_retries:
+					raise
+				time.sleep(0.5)
+	with Image.open(path) as img:
+		return img.convert(mode)
+
 def evaluate_ms_ssim_pair(pred_path, scan_path, model=None, tarea=598400, device=None):
 	if device is None:
 		device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -89,8 +112,8 @@ def evaluate_ms_ssim_pair(pred_path, scan_path, model=None, tarea=598400, device
 		model = HighPrecisionMSSSIM(device=device)
 
 	# Load images as grayscale float64
-	pred_pil = Image.open(pred_path).convert('L')
-	scan_pil = Image.open(scan_path).convert('L')
+	pred_pil = safe_open_image(pred_path, mode='L')
+	scan_pil = safe_open_image(scan_path, mode='L')
 
 	s_w, s_h = scan_pil.size
 	# Target scale matching MATLAB: b = sqrt(tarea / (H * W))

@@ -65,7 +65,22 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 			gt_cache = {}
 
 	img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.PNG', '.JPG', '.JPEG')
-	all_pred = [f for f in os.listdir(pred_dir) if f.lower().endswith(img_exts)]
+	all_pred = []
+	for attempt in range(1, 4):
+		try:
+			all_pred = [f for f in os.listdir(pred_dir) if f.lower().endswith(img_exts)]
+			break
+		except OSError as e:
+			err_str = str(e).lower()
+			if getattr(e, 'errno', None) == 107 or '107' in err_str or 'transport endpoint' in err_str:
+				try:
+					from google.colab import drive
+					drive.mount('/content/drive', force_remount=True)
+				except Exception:
+					pass
+				time.sleep(1.0 * (2 ** (attempt - 1)))
+			else:
+				raise
 	all_pred.sort()
 
 	valid_pairs = []

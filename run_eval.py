@@ -12,15 +12,158 @@ from tqdm.auto import tqdm
 from python.ocr_eval import evaluate_ocr, extract_doc_id, PAPER_SUBSET_IDS, PAPER_70_IDS
 from python.ms_ssim_torch import HighPrecisionMSSSIM, evaluate_ms_ssim_pair
 
-def sync_to_local_ssd(src_dir, dst_dir):
-	os.makedirs(dst_dir, exist_ok=True)
-	files = os.listdir(src_dir)
-	for f in files:
+def remount_google_drive(mount_point='/content/drive', max_retries=3, delay=2.0):
+	"""Attempts to remount Google Drive in Colab if transport endpoint is disconnected."""
+	try:
+		from google.colab import drive
+		print(f"⚠️ Transport endpoint disconnected. Attempting to remount Google Drive at {mount_point}...")
+		for attempt in range(1, max_retries + 1):
+			try:
+				drive.mount(mount_point, force_remount=True)
+				time.sleep(delay)
+				if os.path.exists(mount_point):
+					print("✅ Successfully remounted Google Drive!")
+					return True
+			except Exception as ex:
+				print(f"   Remount attempt {attempt}/{max_retries} failed: {ex}")
+				if attempt < max_retries:
+					time.sleep(delay * (2 ** (attempt - 1)))
+	except ImportError:
+		pass
+	except Exception as e:
+		print(f"⚠️ Unexpected error while remounting drive: {e}")
+	return False
+
+def is_endpoint_error(err):
+	"""Checks if an exception is Errno 107 (Transport endpoint is not connected)."""
+	if isinstance(err, OSError):
+		if getattr(err, 'errno', None) == 107:
+			return True
+	err_str = str(err).lower()
+	return '107' in err_str or 'transport endpoint' in err_str or 'endpoint is not connected' in err_str
+
+def copy_file_with_retry(s_path, d_path, max_retries=3, base_delay=1.0):
+	"""Copies a single file with retry logic, exponential backoff, and drive remount on Errno 107."""
+	for attempt in range(1, max_retries + 1):
+		tmp_d_path = f"{d_path}.tmp_{os.getpid()}"
+		try:
+			if not os.path.exists(s_path) and '/content/drive' in s_path:
+				remount_google_drive()
+
+			src_size = os.path.getsize(s_path)
+			if os.path.exists(d_path) and os.path.getsize(d_path) == src_size and src_size > 0:
+				return True
+
+			shutil.copy2(s_path, tmp_d_path)
+			if os.path.exists(tmp_d_path) and os.path.getsize(tmp_d_path) == src_size:
+				os.replace(tmp_d_path, d_path)
+				return True
+			else:
+				if os.path.exists(tmp_d_path):
+					try:
+						os.remove(tmp_d_path)
+					except Exception:
+						pass
+				raise OSError(f"Size mismatch after copying {os.path.basename(s_path)}")
+		except OSError as e:
+			if os.path.exists(tmp_d_path):
+				try:
+					os.remove(tmp_d_path)
+				except Exception:
+					pass
+
+			if is_endpoint_error(e):
+				print(f"⚠️ [Errno 107] Transport endpoint disconnected on {os.path.basename(s_path)} (attempt {attempt}/{max_retries}).")
+				remount_google_drive()
+			else:
+				print(f"⚠️ OSError copying {os.path.basename(s_path)} (attempt {attempt}/{max_retries}): {e}")
+
+			if attempt < max_retries:
+				time.sleep(base_delay * (2 ** (attempt - 1)))
+			else:
+				return False
+		except Exception as e:
+			if os.path.exists(tmp_d_path):
+				try:
+					os.remove(tmp_d_path)
+				except Exception:
+					pass
+			print(f"⚠️ Unexpected error copying {os.path.basename(s_path)}: {e}")
+			return False
+	return False
+
+def sync_to_local_ssd(src_dir, dst_dir, max_retries=3):
+	"""
+	Syncs images from src_dir (e.g. Google Drive) to local SSD (dst_dir).
+	Resilient to FUSE transport endpoint disconnects (Errno 107) with automatic
+	remounting, exponential backoff, and graceful fallback to src_dir if copying fails.
+	"""
+	if not os.path.exists(src_dir):
+		if '/content/drive' in src_dir:
+			remount_google_drive()
+		if not os.path.exists(src_dir):
+			print(f"⚠️ Source directory does not exist: {src_dir}. Falling back to reading directly.")
+			return src_dir
+
+	try:
+		os.makedirs(dst_dir, exist_ok=True)
+	except Exception as e:
+		print(f"⚠️ Could not create SSD directory {dst_dir}: {e}. Falling back to {src_dir}")
+		return src_dir
+
+	files = []
+	for attempt in range(1, max_retries + 1):
+		try:
+			files = os.listdir(src_dir)
+			break
+		except OSError as e:
+			if is_endpoint_error(e):
+				print(f"⚠️ [Errno 107] Listing {src_dir} failed (attempt {attempt}/{max_retries}). Remounting drive...")
+				remount_google_drive()
+				time.sleep(1.0 * (2 ** (attempt - 1)))
+			else:
+				print(f"⚠️ Listing {src_dir} failed: {e}")
+				break
+
+	if not files:
+		print(f"⚠️ No files found or failed to list {src_dir}. Falling back to {src_dir}")
+		return src_dir
+
+	img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.PNG', '.JPG', '.JPEG')
+	img_files = [f for f in files if f.endswith(img_exts)]
+	if not img_files:
+		return src_dir
+
+	copy_failed = False
+	for f in img_files:
 		s_path = os.path.join(src_dir, f)
 		d_path = os.path.join(dst_dir, f)
-		if os.path.isfile(s_path) and not os.path.exists(d_path):
-			shutil.copy2(s_path, d_path)
+		if not copy_file_with_retry(s_path, d_path, max_retries=max_retries):
+			print(f"⚠️ Failed to copy {f} to local SSD. Falling back to reading directly from {src_dir}.")
+			copy_failed = True
+			break
+
+	if copy_failed:
+		return src_dir
+
 	return dst_dir
+
+def safe_to_csv(df, path, max_retries=3, **kwargs):
+	"""Writes DataFrame to CSV with retry logic and drive remount on transport disconnect."""
+	for attempt in range(1, max_retries + 1):
+		try:
+			os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+			df.to_csv(path, **kwargs)
+			return
+		except OSError as e:
+			if is_endpoint_error(e):
+				print(f"⚠️ [Errno 107] Saving {path} failed (attempt {attempt}/{max_retries}). Remounting drive...")
+				remount_google_drive()
+				time.sleep(1.0 * (2 ** (attempt - 1)))
+			else:
+				if attempt == max_retries:
+					raise
+				time.sleep(1.0)
 
 def ensure_octave_mex(repo_root, matlab_dir, octave_bin='octave'):
 	"""Verifies SIFT Flow MEX binaries can be loaded and executed by Octave; auto-compiles if missing."""
@@ -64,7 +207,10 @@ def ensure_octave_mex(repo_root, matlab_dir, octave_bin='octave'):
 				return True
 			else:
 				print("❌ Auto-compilation or verification failed:")
-				print(comp_res.stderr or comp_res.stdout)
+				if comp_res.stdout:
+					print(comp_res.stdout.strip())
+				if comp_res.stderr:
+					print(comp_res.stderr.strip())
 		except Exception as e:
 			print(f"❌ Could not run compile_mex.sh: {e}")
 
@@ -98,11 +244,21 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 		local_base = '/content/benchmark_cache'
 		work_pred_dir = sync_to_local_ssd(pred_dir, f"{local_base}/pred_{model_name}_{benchmark}")
 		work_gt_dir = sync_to_local_ssd(gt_dir, f"{local_base}/gt_{benchmark}")
-		print('✅ Local SSD sync complete!')
+		if work_pred_dir != pred_dir and work_gt_dir != gt_dir:
+			print('✅ Local SSD sync complete!')
+		else:
+			print('⚠️ Local SSD sync encountered issues; falling back to direct drive reading.')
 
 	# Build paired list
 	img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.PNG', '.JPG', '.JPEG')
-	all_pred = [f for f in os.listdir(work_pred_dir) if f.lower().endswith(img_exts)]
+	try:
+		all_pred = [f for f in os.listdir(work_pred_dir) if f.endswith(img_exts)]
+	except OSError as e:
+		if is_endpoint_error(e):
+			remount_google_drive()
+			all_pred = [f for f in os.listdir(pred_dir) if f.endswith(img_exts)]
+		else:
+			raise
 	all_pred.sort()
 
 	valid_pairs = []
@@ -121,22 +277,36 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 		scan_name = None
 		scan_path = None
 		for ext in img_exts:
-			cand = os.path.join(work_gt_dir, f"{doc_id}{ext}")
-			if os.path.exists(cand):
+			cand_local = os.path.join(work_gt_dir, f"{doc_id}{ext}")
+			if os.path.exists(cand_local):
 				scan_name = f"{doc_id}{ext}"
-				scan_path = cand
+				scan_path = cand_local
 				break
+			cand_drive = os.path.join(gt_dir, f"{doc_id}{ext}")
+			if os.path.exists(cand_drive):
+				scan_name = f"{doc_id}{ext}"
+				scan_path = cand_drive
+				break
+
 		if not scan_path:
 			name_no_ext = os.path.splitext(p_name)[0]
 			for ext in img_exts:
-				cand = os.path.join(work_gt_dir, f"{name_no_ext}{ext}")
-				if os.path.exists(cand):
+				cand_local = os.path.join(work_gt_dir, f"{name_no_ext}{ext}")
+				if os.path.exists(cand_local):
 					scan_name = f"{name_no_ext}{ext}"
-					scan_path = cand
+					scan_path = cand_local
+					break
+				cand_drive = os.path.join(gt_dir, f"{name_no_ext}{ext}")
+				if os.path.exists(cand_drive):
+					scan_name = f"{name_no_ext}{ext}"
+					scan_path = cand_drive
 					break
 
 		if scan_path:
-			valid_pairs.append((p_name, os.path.join(work_pred_dir, p_name), scan_name, scan_path))
+			p_path = os.path.join(work_pred_dir, p_name)
+			if not os.path.exists(p_path) and os.path.exists(os.path.join(pred_dir, p_name)):
+				p_path = os.path.join(pred_dir, p_name)
+			valid_pairs.append((p_name, p_path, scan_name, scan_path))
 
 	df_ms_ssim = None
 	df_ldm = None
@@ -251,31 +421,26 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 		with tempfile.NamedTemporaryFile(suffix='_ocr_metrics.csv', delete=False) as tmp:
 			ocr_csv = tmp.name
 
-		evaluate_ocr(
+		ocr_summary, df_ocr = evaluate_ocr(
 			pred_dir=work_pred_dir,
 			gt_dir=work_gt_dir,
+			benchmark_name=benchmark,
 			output_csv=ocr_csv,
 			cache_json=ocr_cache_json,
-			benchmark_name=benchmark,
 			num_workers=num_workers
 		)
-
 		if os.path.exists(ocr_csv):
-			df_ocr = pd.read_csv(ocr_csv)
-			df_ocr = df_ocr[df_ocr['Index'] != 'SUMMARY'].copy()
 			try:
 				os.remove(ocr_csv)
 			except Exception:
 				pass
 
-	# 4. MERGE METRICS INTO FINAL REPORT
+	# 4. MERGE AND SAVE RESULTS
 	print('\n>>> Merging evaluation results...')
-	base_df = pd.DataFrame({'Dewarped_Image': [p[0] for p in valid_pairs], 'Scan_GT': [p[2] for p in valid_pairs]})
-	base_df.insert(0, 'Model', model_name)
-	base_df.insert(0, 'Index', range(1, len(base_df) + 1))
+	base_df = pd.DataFrame(valid_pairs, columns=['Dewarped_Image', 'Pred_Path', 'Scan_GT', 'Scan_Path'])
 
 	if df_ms_ssim is not None and not df_ms_ssim.empty:
-		base_df = pd.merge(base_df, df_ms_ssim[['Dewarped_Image', 'Scan_GT', 'MS_SSIM_M']], on=['Dewarped_Image', 'Scan_GT'], how='left')
+		base_df = pd.merge(base_df, df_ms_ssim[['Dewarped_Image', 'Scan_GT', 'MS_SSIM_M', 'Time_ssim']], on=['Dewarped_Image', 'Scan_GT'], how='left')
 	elif df_ldm is not None and not df_ldm.empty and 'MS_SSIM_M' in df_ldm.columns:
 		base_df = pd.merge(base_df, df_ldm[['Dewarped_Image', 'Scan_GT', 'MS_SSIM_M']], on=['Dewarped_Image', 'Scan_GT'], how='left')
 
@@ -302,13 +467,12 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 	print('=' * 85)
 
 	if output_csv:
-		os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
 		if save_details:
 			detail_df = pd.concat([base_df, summary_df], ignore_index=True)
-			detail_df.to_csv(output_csv, index=False, encoding='utf-8')
+			safe_to_csv(detail_df, output_csv, index=False, encoding='utf-8')
 			print(f'\nDetailed report saved to: {output_csv}')
 		else:
-			summary_df.to_csv(output_csv, index=False, encoding='utf-8')
+			safe_to_csv(summary_df, output_csv, index=False, encoding='utf-8')
 			print(f'\nSummary report saved to: {output_csv}')
 
 	return summary_df
@@ -411,7 +575,7 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 		)
 
 		if df_sum is not None and not df_sum.empty:
-			df_sum.to_csv(bm_sum_csv, index=False, encoding='utf-8')
+			safe_to_csv(df_sum, bm_sum_csv, index=False, encoding='utf-8')
 			suite_summaries.append(df_sum)
 
 			# Incremental update of consolidated benchmark_summary.csv
@@ -425,7 +589,7 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 					cur_master = df_sum
 			else:
 				cur_master = df_sum
-			cur_master.to_csv(all_summary_csv, index=False, encoding='utf-8')
+			safe_to_csv(cur_master, all_summary_csv, index=False, encoding='utf-8')
 
 	if suite_summaries:
 		master_df = pd.concat(suite_summaries, ignore_index=True)
@@ -434,7 +598,7 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 
 		# 1. Model summary CSV: <Model>_summary.csv
 		model_summary_csv = os.path.join(report_dir, f'{model_name}_summary.csv')
-		master_df.to_csv(model_summary_csv, index=False, encoding='utf-8')
+		safe_to_csv(master_df, model_summary_csv, index=False, encoding='utf-8')
 
 		# 2. Consolidated benchmark_summary.csv across all models
 		all_summary_csv = os.path.join(report_dir, 'benchmark_summary.csv')
@@ -448,7 +612,7 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 				merged_df = master_df
 		else:
 			merged_df = master_df
-		merged_df.to_csv(all_summary_csv, index=False, encoding='utf-8')
+		safe_to_csv(merged_df, all_summary_csv, index=False, encoding='utf-8')
 
 		print('\n' + '=' * 95)
 		print(f'=== MASTER BENCHMARK SUMMARY FOR [{model_name.upper()}] ({time.time() - t_start:.1f}s) ===')

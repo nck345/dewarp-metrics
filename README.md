@@ -35,7 +35,7 @@ Dewarped documents contain black border padding (`RGB = 0`). Evaluating raw SSIM
 Install system dependencies:
 ```bash
 apt-get update -qq
-apt-get install -y octave octave-image liboctave-dev tesseract-ocr libtesseract-dev -qq
+apt-get install -y octave octave-image octave-dev tesseract-ocr libtesseract-dev -qq
 ```
 
 Install Python packages:
