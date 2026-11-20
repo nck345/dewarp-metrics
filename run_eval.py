@@ -481,7 +481,7 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 		with tempfile.NamedTemporaryFile(suffix='_ocr_metrics.csv', delete=False) as tmp:
 			ocr_csv = tmp.name
 
-		ocr_summary, df_ocr = evaluate_ocr(
+		res_ocr = evaluate_ocr(
 			pred_dir=work_pred_dir,
 			gt_dir=work_gt_dir,
 			benchmark_name=benchmark,
@@ -489,11 +489,36 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 			cache_json=ocr_cache_json,
 			num_workers=num_workers
 		)
+		if isinstance(res_ocr, tuple) and len(res_ocr) == 2:
+			ocr_summary, df_ocr = res_ocr
+		else:
+			ocr_summary = res_ocr
+			df_ocr = None
+
+		if df_ocr is None and isinstance(ocr_summary, dict) and 'records' in ocr_summary and ocr_summary['records']:
+			df_ocr = pd.DataFrame(
+				ocr_summary['records'],
+				columns=['Index', 'Dewarped_Image', 'Scan_GT', 'CER', 'ED', 'Time_seconds']
+			)
+			df_ocr['CER'] = pd.to_numeric(df_ocr['CER'], errors='coerce')
+			df_ocr['ED'] = pd.to_numeric(df_ocr['ED'], errors='coerce')
+		elif df_ocr is None and os.path.exists(ocr_csv):
+			try:
+				df_ocr = pd.read_csv(ocr_csv)
+				df_ocr = df_ocr[df_ocr['Index'] != 'SUMMARY'].copy()
+				df_ocr['CER'] = pd.to_numeric(df_ocr['CER'], errors='coerce')
+				df_ocr['ED'] = pd.to_numeric(df_ocr['ED'], errors='coerce')
+			except Exception:
+				pass
+
 		if os.path.exists(ocr_csv):
 			try:
 				os.remove(ocr_csv)
 			except Exception:
 				pass
+
+		if df_ocr is not None and not df_ocr.empty:
+			print(f'✅ Tesseract OCR Complete! Mean CER: {df_ocr["CER"].mean():.4f}, Mean ED: {df_ocr["ED"].mean():.2f}')
 
 	# 4. MERGE AND SAVE RESULTS
 	print('\n>>> Merging evaluation results...')

@@ -4,7 +4,7 @@ import time
 import argparse
 import csv
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from PIL import Image
 from tqdm.auto import tqdm
@@ -190,9 +190,9 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 			return s_name, run_tesseract_ocr(unique_scans[s_name])
 
 		with ThreadPoolExecutor(max_workers=min(num_workers, len(missing_scans))) as scan_exec:
-			futures = [scan_exec.submit(scan_worker, s) for s in missing_scans]
+			future_to_scan = {scan_exec.submit(scan_worker, s): s for s in missing_scans}
 			with tqdm(total=len(missing_scans), desc=f"OCR Scan GT [{benchmark_name}]", unit="page", ncols=95) as pbar:
-				for fut in futures:
+				for fut in as_completed(future_to_scan):
 					s_name, text = fut.result()
 					gt_cache[s_name] = text
 					pbar.update(1)
@@ -227,8 +227,8 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 	with tqdm(total=total, desc=f"OCR Tesseract [{benchmark_name}]", unit="img", ncols=95) as pbar:
 		if num_workers > 1:
 			with ThreadPoolExecutor(max_workers=num_workers) as executor:
-				futures = [executor.submit(process_dewarped_page, item) for item in indexed_items]
-				for fut in futures:
+				future_map = {executor.submit(process_dewarped_page, item): item for item in indexed_items}
+				for fut in as_completed(future_map):
 					res = fut.result()
 					results.append(res)
 					pbar.update(1)
