@@ -59,7 +59,7 @@ python run_eval.py \
   --pred_dir "/path/to/dewarped_images" \
   --gt_dir "/path/to/scan_images" \
   --model_name "DocTr" \
-  --benchmark "docunet_paper_subset" \
+  --benchmark "docunet_130" \
   --output_csv "eval_reports/DocTr_report.csv" \
   --ms_ssim_backend "torch" \
   --workers 2
@@ -72,7 +72,7 @@ Evaluate across multiple or all benchmarks in one command:
 python run_eval.py \
   --base_dir "/path/to/Document_Dewarp_Benchmark" \
   --model_name "DocTr" \
-  --benchmarks docunet_paper_subset dir300 docreal \
+  --benchmarks docunet_130 dir300 docreal \
   --ms_ssim_backend "torch" \
   --workers 2
 ```
@@ -80,7 +80,6 @@ Use `--benchmarks all` to evaluate all benchmarks. Results are automatically sav
 
 Available arguments:
 - `--benchmark`: Subset to evaluate:
-  - `docunet_paper_subset`: 60 images corresponding to 30 paper scan IDs (Setting 1).
   - `docunet_paper_70`: 70 images list from original paper OCR script.
   - `docunet_130`: Full 130 images of DocUNet benchmark.
   - `dir300`: Full 300 real/synthetic image pairs of DIR300 benchmark.

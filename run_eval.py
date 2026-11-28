@@ -9,7 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 from tqdm.auto import tqdm
-from python.ocr_eval import evaluate_ocr, extract_doc_id, PAPER_SUBSET_IDS, PAPER_70_IDS
+from python.ocr_eval import evaluate_ocr, extract_doc_id, PAPER_70_IDS
 from python.ms_ssim_torch import HighPrecisionMSSSIM, evaluate_ms_ssim_pair
 
 _drive_remount_lock = threading.Lock()
@@ -271,7 +271,7 @@ def ensure_octave_mex(repo_root, matlab_dir, octave_bin='octave'):
 
 	return False
 
-def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_paper_subset',
+def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_130',
                    output_csv=None, ocr_cache_json=None, octave_bin='octave',
                    ms_ssim_backend='torch', num_workers=2, use_local_ssd=True,
                    skip_image=False, skip_ocr=False, save_details=False, **kwargs):
@@ -324,10 +324,7 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_pape
 	valid_pairs = []
 	for p_name in all_pred:
 		doc_id = extract_doc_id(p_name)
-		if benchmark == 'docunet_paper_subset':
-			if doc_id not in PAPER_SUBSET_IDS:
-				continue
-		elif benchmark == 'docunet_paper_70':
+		if benchmark == 'docunet_paper_70':
 			try:
 				if int(doc_id) not in PAPER_70_IDS:
 					continue
@@ -578,7 +575,7 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 	if num_workers is None or num_workers < 1:
 		num_workers = min(4, os.cpu_count() or 2)
 
-	all_supported = ['docunet_paper_subset', 'docunet_130', 'dir300', 'docreal']
+	all_supported = ['docunet_130', 'dir300', 'docreal']
 	if benchmarks is None or benchmarks == 'all' or (isinstance(benchmarks, (list, tuple)) and 'all' in benchmarks):
 		target_bms = all_supported
 	elif isinstance(benchmarks, str):
@@ -638,11 +635,11 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 				pass
 
 		gt_dir = os.path.join(base_dir, 'benchmarks', bm, 'scan')
-		if not os.path.exists(gt_dir) and bm in ['docunet_paper_subset', 'docunet_130']:
+		if not os.path.exists(gt_dir) and bm == 'docunet_130':
 			gt_dir = os.path.join(base_dir, 'data_benchmark', 'scan', 'scan')
 
 		pred_dir = os.path.join(base_dir, 'predictions', model_name, bm)
-		if not os.path.exists(pred_dir) and bm in ['docunet_paper_subset', 'docunet_130']:
+		if not os.path.exists(pred_dir) and bm == 'docunet_130':
 			pred_dir = os.path.join(base_dir, 'predictions', model_name)
 
 		if not os.path.exists(gt_dir):
@@ -731,8 +728,8 @@ if __name__ == '__main__':
 	parser.add_argument('--pred_dir', type=str, default=None, help='Directory of dewarped images')
 	parser.add_argument('--gt_dir', type=str, default=None, help='Directory of ground truth scan images')
 	parser.add_argument('--model_name', type=str, default='Model', help='Name of the evaluated model')
-	parser.add_argument('--benchmark', type=str, default='docunet_paper_subset',
-	                    choices=['docunet_paper_subset', 'docunet_paper_70', 'docunet_130', 'dir300', 'docreal', 'all'])
+	parser.add_argument('--benchmark', type=str, default='docunet_130',
+	                    choices=['docunet_paper_70', 'docunet_130', 'dir300', 'docreal', 'all'])
 	parser.add_argument('--output_csv', type=str, default=None, help='Path to output merged CSV report')
 	parser.add_argument('--ocr_cache_json', type=str, default=None, help='Path to cache GT OCR JSON')
 	parser.add_argument('--octave_bin', type=str, default='octave', help='Path to GNU Octave executable')

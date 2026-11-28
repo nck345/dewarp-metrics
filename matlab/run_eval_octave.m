@@ -68,10 +68,6 @@ if ~has_flow
     error('mexDiscreteFlow MEX binary not found or not callable! Please run compile_mex.sh first.');
 end
 
-paper_ids = {'1', '2', '3', '4', '5', '6', '7', '9', '10', '21', ...
-             '22', '23', '24', '27', '30', '31', '32', '36', '38', '40', ...
-             '41', '44', '45', '46', '47', '48', '50', '51', '52', '53'};
-
 raw_files = dir(pred_dir);
 img_exts = {'.png', '.jpg', '.jpeg', '.bmp', '.PNG', '.JPG', '.JPEG'};
 pred_list = {};
@@ -96,12 +92,6 @@ for k = 1:length(pred_list)
     doc_id = regexprep(parts{1}, '[^0-9]', '');
     if isempty(doc_id)
         doc_id = regexprep(name_no_ext, '[^0-9]', '');
-    end
-
-    if strcmpi(benchmark_name, 'docunet_paper_subset')
-        if ~ismember(doc_id, paper_ids)
-            continue;
-        end
     end
 
     gt_file = '';

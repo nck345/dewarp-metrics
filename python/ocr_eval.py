@@ -41,12 +41,6 @@ except ImportError:
 					matrix[i][j] = min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + d)
 			return matrix[len(str1)][len(str2)]
 
-PAPER_SUBSET_IDS = {
-	'1', '2', '3', '4', '5', '6', '7', '9', '10', '21',
-	'22', '23', '24', '27', '30', '31', '32', '36', '38', '40',
-	'41', '44', '45', '46', '47', '48', '50', '51', '52', '53'
-}
-
 PAPER_70_IDS = {
 	2, 5, 17, 19, 20, 23, 31, 37, 38, 39, 40, 41, 43, 45, 47, 48, 51, 54, 57, 60,
 	61, 62, 64, 65, 67, 68, 70, 75, 76, 77, 78, 80, 81, 83, 84, 85, 87, 88, 90, 91,
@@ -100,7 +94,7 @@ def run_tesseract_ocr(img_path, max_retries=3):
 					time.sleep(0.5)
 	return ''
 
-def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_name='docunet_paper_subset',
+def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_name='docunet_130',
                  num_workers=2):
 	gt_cache = {}
 	if cache_json and os.path.exists(cache_json):
@@ -133,10 +127,7 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 	valid_pairs = []
 	for p_name in all_pred:
 		doc_id = extract_doc_id(p_name)
-		if benchmark_name == 'docunet_paper_subset':
-			if doc_id not in PAPER_SUBSET_IDS:
-				continue
-		elif benchmark_name == 'docunet_paper_70':
+		if benchmark_name == 'docunet_paper_70':
 			try:
 				if int(doc_id) not in PAPER_70_IDS:
 					continue
@@ -288,8 +279,8 @@ if __name__ == '__main__':
 	parser.add_argument('--gt_dir', type=str, required=True, help='Directory of ground truth scan images')
 	parser.add_argument('--output_csv', type=str, default=None, help='Path to output CSV report')
 	parser.add_argument('--cache_json', type=str, default=None, help='Path to cache GT OCR JSON file')
-	parser.add_argument('--benchmark', type=str, default='docunet_paper_subset',
-	                    choices=['docunet_paper_subset', 'docunet_paper_70', 'docunet_130', 'dir300', 'docreal', 'all'])
+	parser.add_argument('--benchmark', type=str, default='docunet_130',
+	                    choices=['docunet_paper_70', 'docunet_130', 'dir300', 'docreal', 'all'])
 	parser.add_argument('--workers', type=int, default=2, help='Number of parallel worker threads')
 	args = parser.parse_args()
 
