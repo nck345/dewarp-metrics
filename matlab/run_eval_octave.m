@@ -1,9 +1,9 @@
-function run_eval_octave(pred_dir, gt_dir, output_csv, benchmark_name, part_idx, total_parts, skip_ms)
+function run_eval_octave(pred_dir, gt_dir, output_csv, benchmark_name, part_idx, total_parts, skip_ms, pending_list_file)
 % RUN_EVAL_OCTAVE Universal Headless Image Metrics Runner (MS-SSIM-M & LD-M)
 % Compatible with GNU Octave (Google Colab / Linux / Windows) and MATLAB.
 
 if nargin < 2
-    error('Usage: run_eval_octave(pred_dir, gt_dir, [output_csv], [benchmark_name], [part_idx], [total_parts], [skip_ms])');
+    error('Usage: run_eval_octave(pred_dir, gt_dir, [output_csv], [benchmark_name], [part_idx], [total_parts], [skip_ms], [pending_list_file])');
 end
 
 if nargin < 3 || isempty(output_csv)
@@ -22,6 +22,9 @@ if nargin < 6 || isempty(total_parts)
 end
 if nargin < 7 || isempty(skip_ms)
     skip_ms = false;
+end
+if nargin < 8 || isempty(pending_list_file)
+    pending_list_file = '';
 end
 
 if ischar(part_idx)
@@ -83,6 +86,29 @@ for k = 1:length(raw_files)
 end
 
 pred_list = sort(pred_list);
+
+if ~isempty(pending_list_file) && exist(pending_list_file, 'file')
+    pend_set = {};
+    pfid = fopen(pending_list_file, 'r');
+    if pfid ~= -1
+        while ~feof(pfid)
+            ln = fgetl(pfid);
+            if ischar(ln)
+                ln = strtrim(ln);
+                if ~isempty(ln)
+                    pend_set{end+1} = ln;
+                end
+            end
+        end
+        fclose(pfid);
+    end
+    if ~isempty(pend_set)
+        keep_mask = ismember(pred_list, pend_set);
+        pred_list = pred_list(keep_mask);
+    else
+        pred_list = {};
+    end
+end
 
 valid_pairs = {};
 for k = 1:length(pred_list)
@@ -274,6 +300,7 @@ for i = 1:num_pairs
     results_cell{i, 6} = img_time;
 
     fprintf('PROGRESS_DONE: %s | LD-M: %.4f\n', pair.pred_name, ld_val);
+    fprintf('PROGRESS_RESULT: %s\t%s\t%.6f\t%.6f\t%.4f\n', pair.pred_name, pair.scan_name, ms_val, ld_val, img_time);
     fflush(stdout);
 end
 

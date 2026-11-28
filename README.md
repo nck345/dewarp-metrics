@@ -89,5 +89,8 @@ Available arguments:
 - `--workers`: Number of parallel worker processes/threads (default: 2).
 - `--ocr_cache_json`: Path to JSON cache for ground truth scan OCR texts.
 - `--skip_image`: Skip MS-SSIM-M and LD-M.
+- `--skip_ldm`: Skip LD-M (GNU Octave SIFT Flow) while keeping MS-SSIM-M (GPU) and OCR.
 - `--skip_ocr`: Skip CER and ED.
+- `--no_resume`: Clear per-step/per-image checkpoints and re-evaluate from scratch (default: resume from `eval_reports/.checkpoints/`).
+- `--checkpoint_dir`: Custom directory for per-step/per-image checkpoints.
 - `--save_details`: Save detailed per-image rows (default: False, only benchmark summary is saved).

@@ -3,11 +3,16 @@ import json
 import time
 import argparse
 import csv
-import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from PIL import Image
 from tqdm.auto import tqdm
+
+try:
+	from python.checkpoint_utils import StepCkpt, is_endpoint_error, remount_google_drive, safe_json_dump
+except ImportError:
+	from checkpoint_utils import StepCkpt, is_endpoint_error, remount_google_drive, safe_json_dump
 
 try:
 	import pytesseract
@@ -74,14 +79,8 @@ def run_tesseract_ocr(img_path, max_retries=3):
 		try:
 			return pytesseract.image_to_string(img_path)
 		except Exception as e:
-			err_str = str(e).lower()
-			if getattr(e, 'errno', None) == 107 or '107' in err_str or 'transport endpoint' in err_str:
-				try:
-					from google.colab import drive
-					subprocess.run(['fusermount', '-u', '-z', '/content/drive'], capture_output=True)
-					drive.mount('/content/drive', force_remount=True)
-				except Exception:
-					pass
+			if is_endpoint_error(e):
+				remount_google_drive()
 				time.sleep(1.0 * (2 ** (attempt - 1)))
 			else:
 				try:
@@ -95,7 +94,7 @@ def run_tesseract_ocr(img_path, max_retries=3):
 	return ''
 
 def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_name='docunet_130',
-                 num_workers=2):
+                 num_workers=2, ckpt_csv=None, resume=True, seed_df=None):
 	gt_cache = {}
 	if cache_json and os.path.exists(cache_json):
 		try:
@@ -111,14 +110,8 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 			all_pred = [f for f in os.listdir(pred_dir) if f.lower().endswith(img_exts)]
 			break
 		except OSError as e:
-			err_str = str(e).lower()
-			if getattr(e, 'errno', None) == 107 or '107' in err_str or 'transport endpoint' in err_str:
-				try:
-					from google.colab import drive
-					subprocess.run(['fusermount', '-u', '-z', '/content/drive'], capture_output=True)
-					drive.mount('/content/drive', force_remount=True)
-				except Exception:
-					pass
+			if is_endpoint_error(e):
+				remount_google_drive()
 				time.sleep(1.0 * (2 ** (attempt - 1)))
 			else:
 				raise
@@ -169,69 +162,111 @@ def evaluate_ocr(pred_dir, gt_dir, output_csv=None, cache_json=None, benchmark_n
 		print('No valid image pairs found.')
 		return {}
 
-	# Precompute and cache ground truth scan pages
-	unique_scans = {}
-	for _, _, s_name, s_path in valid_pairs:
-		if s_name not in unique_scans:
-			unique_scans[s_name] = s_path
+	Ckpt = StepCkpt(ckpt_csv, ['Dewarped_Image', 'Scan_GT', 'CER', 'ED', 'Time_seconds']) if ckpt_csv else None
+	Done_map = Ckpt.load(use_res=resume, seed_df=seed_df, val_cols=['CER', 'ED']) if Ckpt else {}
 
-	missing_scans = [s for s in unique_scans if s not in gt_cache]
-	if missing_scans:
-		def scan_worker(s_name):
-			return s_name, run_tesseract_ocr(unique_scans[s_name])
+	indexed_items = list(enumerate(valid_pairs, 1))
+	results = []
+	pending_items = []
+	for item in indexed_items:
+		idx, (p_name, _, s_name, _) = item
+		key = (p_name, s_name)
+		if key in Done_map:
+			rec = Done_map[key]
+			cer_v = float(rec['CER'])
+			ed_v = int(float(rec['ED']))
+			el_v = float(rec['Time_seconds']) if rec.get('Time_seconds') not in (None, '') else 0.0
+			results.append((idx, p_name, s_name, cer_v, ed_v, el_v))
+		else:
+			pending_items.append(item)
 
-		with ThreadPoolExecutor(max_workers=min(num_workers, len(missing_scans))) as scan_exec:
-			future_to_scan = {scan_exec.submit(scan_worker, s): s for s in missing_scans}
-			with tqdm(total=len(missing_scans), desc=f"OCR Scan GT [{benchmark_name}]", unit="page", ncols=95) as pbar:
-				for fut in as_completed(future_to_scan):
-					s_name, text = fut.result()
-					gt_cache[s_name] = text
-					pbar.update(1)
-		if cache_json:
-			try:
-				os.makedirs(os.path.dirname(os.path.abspath(cache_json)), exist_ok=True)
-				with open(cache_json, 'w', encoding='utf-8') as f:
-					json.dump(gt_cache, f, ensure_ascii=False, indent=2)
-				print(f'Saved ground truth OCR cache to: {cache_json}')
-			except Exception:
-				pass
+	if not pending_items:
+		print(f'⚡ [RESUME] Đã khôi phục toàn bộ {total}/{total} ảnh OCR từ cache. Bỏ qua đo lại!')
 	else:
-		print(f'⚡ Loaded all {len(unique_scans)} ground truth scan texts from cache in 0.001s!')
+		if results:
+			print(f'⚡ [RESUME] Khôi phục {len(results)}/{total} ảnh OCR từ cache, tiếp tục đo {len(pending_items)} ảnh...')
+		unique_scans = {}
+		for _, (_, _, s_name, s_path) in pending_items:
+			if s_name not in unique_scans:
+				unique_scans[s_name] = s_path
+
+		missing_scans = [s for s in unique_scans if s not in gt_cache]
+		if missing_scans:
+			gt_lock = threading.Lock()
+			gt_dirty = False
+			def scan_worker(s_name):
+				return s_name, run_tesseract_ocr(unique_scans[s_name])
+
+			try:
+				with ThreadPoolExecutor(max_workers=min(num_workers, len(missing_scans))) as scan_exec:
+					future_to_scan = {scan_exec.submit(scan_worker, s): s for s in missing_scans}
+					with tqdm(total=len(missing_scans), desc=f"OCR Scan GT [{benchmark_name}]", unit="page", ncols=95) as pbar:
+						done_cnt = 0
+						for fut in as_completed(future_to_scan):
+							s_name, text = fut.result()
+							with gt_lock:
+								gt_cache[s_name] = text
+								gt_dirty = True
+								done_cnt += 1
+								snap = dict(gt_cache) if (cache_json and done_cnt % 10 == 0) else None
+							if snap is not None:
+								if safe_json_dump(snap, cache_json):
+									gt_dirty = False
+							pbar.update(1)
+			finally:
+				if cache_json and gt_dirty:
+					with gt_lock:
+						snap = dict(gt_cache)
+					if safe_json_dump(snap, cache_json):
+						print(f'Saved ground truth OCR cache to: {cache_json}')
+		else:
+			print(f'⚡ Loaded all {len(unique_scans)} ground truth scan texts from cache in 0.001s!')
+
+		def process_dewarped_page(item):
+			idx, (p_name, p_path, s_name, _) = item
+			t_item = time.time()
+			text_gt = gt_cache.get(s_name, '')
+			text_pred = run_tesseract_ocr(p_path)
+			ed = levenshtein_dist(text_gt, text_pred)
+			cer = float(ed / max(1, len(text_gt)))
+			elapsed = time.time() - t_item
+			return (idx, p_name, s_name, cer, ed, elapsed)
+
+		with tqdm(total=total, initial=len(results), desc=f"OCR Tesseract [{benchmark_name}]", unit="img", ncols=95) as pbar:
+			if num_workers > 1:
+				with ThreadPoolExecutor(max_workers=num_workers) as executor:
+					future_map = {executor.submit(process_dewarped_page, item): item for item in pending_items}
+					for fut in as_completed(future_map):
+						res = fut.result()
+						results.append(res)
+						if Ckpt is not None:
+							Ckpt.append({
+								'Dewarped_Image': res[1],
+								'Scan_GT': res[2],
+								'CER': round(res[3], 6),
+								'ED': int(res[4]),
+								'Time_seconds': round(res[5], 3)
+							})
+						pbar.update(1)
+						pbar.set_postfix({'CER': f"{np.mean([r[3] for r in results]):.4f}"})
+			else:
+				for item in pending_items:
+					res = process_dewarped_page(item)
+					results.append(res)
+					if Ckpt is not None:
+						Ckpt.append({
+							'Dewarped_Image': res[1],
+							'Scan_GT': res[2],
+							'CER': round(res[3], 6),
+							'ED': int(res[4]),
+							'Time_seconds': round(res[5], 3)
+						})
+					pbar.update(1)
+					pbar.set_postfix({'CER': f"{np.mean([r[3] for r in results]):.4f}"})
 
 	cer_list, ed_list, time_list = [], [], []
 	records = []
 	t_start_all = time.time()
-
-	def process_dewarped_page(item):
-		idx, (p_name, p_path, s_name, _) = item
-		t_item = time.time()
-		text_gt = gt_cache.get(s_name, '')
-		text_pred = run_tesseract_ocr(p_path)
-		ed = levenshtein_dist(text_gt, text_pred)
-		cer = float(ed / max(1, len(text_gt)))
-		elapsed = time.time() - t_item
-		return (idx, p_name, s_name, cer, ed, elapsed)
-
-	indexed_items = list(enumerate(valid_pairs, 1))
-	results = []
-
-	with tqdm(total=total, desc=f"OCR Tesseract [{benchmark_name}]", unit="img", ncols=95) as pbar:
-		if num_workers > 1:
-			with ThreadPoolExecutor(max_workers=num_workers) as executor:
-				future_map = {executor.submit(process_dewarped_page, item): item for item in indexed_items}
-				for fut in as_completed(future_map):
-					res = fut.result()
-					results.append(res)
-					pbar.update(1)
-					current_cers = [r[3] for r in results]
-					pbar.set_postfix({'CER': f"{np.mean(current_cers):.4f}"})
-		else:
-			for item in indexed_items:
-				res = process_dewarped_page(item)
-				results.append(res)
-				pbar.update(1)
-				current_cers = [r[3] for r in results]
-				pbar.set_postfix({'CER': f"{np.mean(current_cers):.4f}"})
 
 	results.sort(key=lambda x: x[0])
 	for idx, p_name, s_name, cer, ed, elapsed in results:

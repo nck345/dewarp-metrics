@@ -9,51 +9,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 from tqdm.auto import tqdm
+from python.checkpoint_utils import StepCkpt, is_endpoint_error, remount_google_drive, safe_read_csv, safe_to_csv
 from python.ocr_eval import evaluate_ocr, extract_doc_id, PAPER_70_IDS
 from python.ms_ssim_torch import HighPrecisionMSSSIM, evaluate_ms_ssim_pair
-
-_drive_remount_lock = threading.Lock()
-
-def remount_google_drive(mount_point='/content/drive', max_retries=3, delay=2.0):
-	"""Attempts to remount Google Drive in Colab if transport endpoint is disconnected."""
-	with _drive_remount_lock:
-		my_drive = os.path.join(mount_point, 'MyDrive')
-		if os.path.exists(my_drive):
-			return True
-
-		try:
-			from google.colab import drive
-			print(f"⚠️ Transport endpoint disconnected. Attempting to remount Google Drive at {mount_point}...")
-			for attempt in range(1, max_retries + 1):
-				try:
-					subprocess.run(['fusermount', '-u', '-z', mount_point], capture_output=True)
-					subprocess.run(['umount', '-l', mount_point], capture_output=True)
-				except Exception:
-					pass
-
-				try:
-					drive.mount(mount_point, force_remount=True)
-					time.sleep(delay)
-					if os.path.exists(my_drive):
-						print("✅ Successfully remounted Google Drive!")
-						return True
-				except Exception as ex:
-					print(f"   Remount attempt {attempt}/{max_retries} failed: {ex}")
-					if attempt < max_retries:
-						time.sleep(delay * (2 ** (attempt - 1)))
-		except ImportError:
-			pass
-		except Exception as e:
-			print(f"⚠️ Unexpected error while remounting drive: {e}")
-		return False
-
-def is_endpoint_error(err):
-	"""Checks if an exception is Errno 107 (Transport endpoint is not connected)."""
-	if isinstance(err, OSError):
-		if getattr(err, 'errno', None) == 107:
-			return True
-	err_str = str(err).lower()
-	return '107' in err_str or 'transport endpoint' in err_str or 'endpoint is not connected' in err_str
 
 def copy_file_with_retry(s_path, d_path, max_retries=5, base_delay=0.5):
 	"""Copies a single file with retry logic, exponential backoff, and drive remount on Errno 107."""
@@ -192,23 +150,6 @@ def sync_to_local_ssd(src_dir, dst_dir, max_retries=5):
 
 	return dst_dir
 
-def safe_to_csv(df, path, max_retries=3, **kwargs):
-	"""Writes DataFrame to CSV with retry logic and drive remount on transport disconnect."""
-	for attempt in range(1, max_retries + 1):
-		try:
-			os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-			df.to_csv(path, **kwargs)
-			return
-		except OSError as e:
-			if is_endpoint_error(e):
-				print(f"⚠️ [Errno 107] Saving {path} failed (attempt {attempt}/{max_retries}). Remounting drive...")
-				remount_google_drive()
-				time.sleep(1.0 * (2 ** (attempt - 1)))
-			else:
-				if attempt == max_retries:
-					raise
-				time.sleep(1.0)
-
 def ensure_octave_mex(repo_root, matlab_dir, octave_bin='octave'):
 	"""Verifies SIFT Flow MEX binaries can be loaded and executed by Octave; auto-compiles if missing."""
 	if shutil.which(octave_bin) is None:
@@ -274,7 +215,8 @@ def ensure_octave_mex(repo_root, matlab_dir, octave_bin='octave'):
 def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_130',
                    output_csv=None, ocr_cache_json=None, octave_bin='octave',
                    ms_ssim_backend='torch', num_workers=2, use_local_ssd=True,
-                   skip_image=False, skip_ocr=False, save_details=False, **kwargs):
+                   skip_image=False, skip_ldm=False, skip_ocr=False, save_details=False,
+                   resume=True, checkpoint_dir=None, seed_csv=None, **kwargs):
 	repo_root = os.path.dirname(os.path.abspath(__file__))
 	matlab_dir = os.path.join(repo_root, 'matlab')
 
@@ -287,15 +229,25 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_130'
 				octave_bin = cand
 				break
 
+	if checkpoint_dir:
+		ckpt_dir = os.path.abspath(checkpoint_dir)
+	elif output_csv:
+		ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(output_csv)), '.checkpoints', f'{model_name}_{benchmark}')
+	else:
+		ckpt_dir = tempfile.mkdtemp(prefix='dewarp_ckpt_')
+	os.makedirs(ckpt_dir, exist_ok=True)
+	loc_ckpt_dir = f"/content/benchmark_cache/ckpt_{model_name}_{benchmark}" if (use_local_ssd and ('/content/drive' in pred_dir or '/content/drive' in ckpt_dir)) else None
+
 	print('=' * 95)
 	print('=== DEWARP-METRICS UNIVERSAL BENCHMARK EVALUATOR ===')
 	print(f'Model Name        : {model_name}')
 	print(f'Benchmark         : {benchmark}')
 	print(f'Dewarped Dir      : {pred_dir}')
 	print(f'Ground Truth Dir  : {gt_dir}')
-	print(f'MS-SSIM-M Backend : {"GPU (PyTorch float64 - Exact)" if ms_ssim_backend == "torch" else "CPU (GNU Octave)"}')
-	print(f'LD-M Backend      : GNU Octave SIFT Flow C++ MEX (-O3 + Scan SIFT Cache + {num_workers} Workers)')
-	print(f'OCR Engine        : Tesseract 5.0 (GT Cache + {num_workers} Workers)')
+	print(f'Checkpoint Dir    : {ckpt_dir} (Resume: {resume})')
+	print(f'MS-SSIM-M Backend : {"Skipped" if skip_image else ("GPU (PyTorch float64 - Exact)" if ms_ssim_backend == "torch" else "CPU (GNU Octave)")}')
+	print(f'LD-M Backend      : {"Skipped" if (skip_image or skip_ldm) else f"GNU Octave SIFT Flow C++ MEX (-O3 + Scan SIFT Cache + {num_workers} Workers)"}')
+	print(f'OCR Engine        : {"Skipped" if skip_ocr else f"Tesseract 5.0 (GT Cache + {num_workers} Workers)"}')
 	print('=' * 95)
 
 	work_pred_dir = pred_dir
@@ -365,6 +317,19 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_130'
 				p_path = os.path.join(pred_dir, p_name)
 			valid_pairs.append((p_name, p_path, scan_name, scan_path))
 
+	if not valid_pairs:
+		print('Warning: No valid image pairs found.')
+		return pd.DataFrame()
+
+	seed_df = None
+	seed_path = seed_csv if (seed_csv and os.path.exists(seed_csv)) else (output_csv if (output_csv and save_details and os.path.exists(output_csv)) else None)
+	if resume and seed_path:
+		raw_seed = safe_read_csv(seed_path)
+		if raw_seed is not None and not raw_seed.empty and 'Dewarped_Image' in raw_seed.columns:
+			if 'Index' in raw_seed.columns:
+				raw_seed = raw_seed[raw_seed['Index'].astype(str) != 'SUMMARY'].copy()
+			seed_df = raw_seed
+
 	df_ms_ssim = None
 	df_ldm = None
 	df_ocr = None
@@ -372,119 +337,198 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_130'
 	# 1. MS-SSIM-M EVALUATION
 	if not skip_image and ms_ssim_backend == 'torch':
 		print('\n>>> [Step 1/3] Computing MS-SSIM-M on GPU via PyTorch (Double Precision float64)...')
-		import torch
-		dev = 'cuda' if torch.cuda.is_available() else 'cpu'
-		model_ssim = HighPrecisionMSSSIM(device=dev)
-		ms_records = []
+		ckpt1_drv = os.path.join(ckpt_dir, 'step1_ms_ssim.csv')
+		ckpt1_loc = os.path.join(loc_ckpt_dir, 'step1_ms_ssim.csv') if loc_ckpt_dir else None
+		Ckpt1 = StepCkpt(ckpt1_drv, ['Dewarped_Image', 'Scan_GT', 'MS_SSIM_M', 'Time_ssim'], loc_p=ckpt1_loc)
+		Done1 = Ckpt1.load(use_res=resume, seed_df=seed_df, val_cols=['MS_SSIM_M'])
+		pend1 = [(p_name, p_path, s_name, s_path) for (p_name, p_path, s_name, s_path) in valid_pairs if (p_name, s_name) not in Done1]
 		t_ssim_start = time.time()
-		with tqdm(total=len(valid_pairs), desc=f"MS-SSIM-M GPU [{benchmark}]", unit="img", ncols=95) as pbar:
-			for p_name, p_path, s_name, s_path in valid_pairs:
-				t0 = time.time()
-				score = evaluate_ms_ssim_pair(p_path, s_path, model=model_ssim, device=dev)
-				t_el = time.time() - t0
-				ms_records.append({'Dewarped_Image': p_name, 'Scan_GT': s_name, 'MS_SSIM_M': score, 'Time_ssim': t_el})
-				pbar.update(1)
-				pbar.set_postfix({'Score': f"{score:.4f}"})
-		df_ms_ssim = pd.DataFrame(ms_records)
-		t_ssim_total = time.time() - t_ssim_start
-		print(f'✅ MS-SSIM-M GPU Complete! Mean: {df_ms_ssim["MS_SSIM_M"].mean():.4f} in {t_ssim_total:.2f}s')
+		if not pend1:
+			print(f'⚡ [RESUME] Step 1 (MS-SSIM-M) đã hoàn tất từ cache ({len(valid_pairs)}/{len(valid_pairs)} ảnh). Bỏ qua!')
+		else:
+			if Done1:
+				print(f'⚡ [RESUME] Khôi phục {len(valid_pairs) - len(pend1)}/{len(valid_pairs)} ảnh MS-SSIM-M, tiếp tục đo {len(pend1)} ảnh...')
+			import torch
+			dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+			model_ssim = HighPrecisionMSSSIM(device=dev)
+			with tqdm(total=len(valid_pairs), initial=len(valid_pairs) - len(pend1), desc=f"MS-SSIM-M GPU [{benchmark}]", unit="img", ncols=95) as pbar:
+				for p_name, p_path, s_name, s_path in pend1:
+					t0 = time.time()
+					score = evaluate_ms_ssim_pair(p_path, s_path, model=model_ssim, device=dev)
+					t_el = time.time() - t0
+					Ckpt1.append({'Dewarped_Image': p_name, 'Scan_GT': s_name, 'MS_SSIM_M': float(score), 'Time_ssim': round(t_el, 4)})
+					pbar.update(1)
+					pbar.set_postfix({'Score': f"{score:.4f}"})
+		df_ms_ssim = Ckpt1.to_df(valid_pairs)
+		if not df_ms_ssim.empty:
+			df_ms_ssim['MS_SSIM_M'] = pd.to_numeric(df_ms_ssim['MS_SSIM_M'], errors='coerce')
+			df_ms_ssim['Time_ssim'] = pd.to_numeric(df_ms_ssim['Time_ssim'], errors='coerce')
+			t_ssim_total = time.time() - t_ssim_start
+			print(f'✅ MS-SSIM-M GPU Complete! Mean: {df_ms_ssim["MS_SSIM_M"].mean():.4f} in {t_ssim_total:.2f}s')
 
 	# 2. LD-M EVALUATION (OCTAVE SIFT FLOW)
-	if not skip_image:
+	if not skip_image and not skip_ldm:
 		skip_octave_ms = (ms_ssim_backend == 'torch')
 		step_name = '2/3' if ms_ssim_backend == 'torch' else '1/2'
 		print(f'\n>>> [Step {step_name}] Computing LD-M via GNU Octave SIFT Flow ({num_workers} parallel workers)...')
 
-		if not ensure_octave_mex(repo_root, matlab_dir, octave_bin):
+		ckpt2_drv = os.path.join(ckpt_dir, 'step2_ldm.csv')
+		ckpt2_loc = os.path.join(loc_ckpt_dir, 'step2_ldm.csv') if loc_ckpt_dir else None
+		Ckpt2 = StepCkpt(ckpt2_drv, ['Dewarped_Image', 'Scan_GT', 'MS_SSIM_M', 'LD_M', 'Time_seconds'], loc_p=ckpt2_loc)
+		Done2 = Ckpt2.load(use_res=resume, seed_df=seed_df, val_cols=['LD_M'])
+		pend2 = [(p_name, p_path, s_name, s_path) for (p_name, p_path, s_name, s_path) in valid_pairs if (p_name, s_name) not in Done2]
+
+		if not pend2:
+			print(f'⚡ [RESUME] Step 2 (LD-M) đã hoàn tất từ cache ({len(valid_pairs)}/{len(valid_pairs)} ảnh). Bỏ qua!')
+			df_ldm = Ckpt2.to_df(valid_pairs)
+		elif not ensure_octave_mex(repo_root, matlab_dir, octave_bin):
 			print("⚠️ CẢNH BÁO: Không thể tải hoặc biên dịch SIFT Flow MEX cho GNU Octave. Bỏ qua đo LD-M.")
 		else:
+			if Done2:
+				print(f'⚡ [RESUME] Khôi phục {len(valid_pairs) - len(pend2)}/{len(valid_pairs)} ảnh LD-M, tiếp tục đo {len(pend2)} ảnh...')
 			t_ldm_start = time.time()
-			pbar_ldm = tqdm(total=len(valid_pairs), desc=f"LD-M Octave [{benchmark}]", unit="img", ncols=95)
+			pbar_ldm = tqdm(total=len(valid_pairs), initial=len(valid_pairs) - len(pend2), desc=f"LD-M Octave [{benchmark}]", unit="img", ncols=95)
 			pbar_lock = threading.Lock()
+			eff_workers = min(num_workers, len(pend2))
+			pending_list_file = None
+			try:
+				with tempfile.NamedTemporaryFile(mode='w', suffix='_pending_ldm.txt', delete=False, encoding='utf-8') as pf:
+					pending_list_file = pf.name
+					for p_name, _, _, _ in pend2:
+						pf.write(p_name + '\n')
 
-			def run_octave_worker(part_idx):
-				with tempfile.NamedTemporaryFile(suffix=f'_image_part{part_idx}.csv', delete=False) as tmp:
-					part_csv = tmp.name
+				oct_pending = pending_list_file.replace('\\', '/')
 
-				oct_pred = work_pred_dir.replace('\\', '/')
-				oct_gt = work_gt_dir.replace('\\', '/')
-				oct_out = part_csv.replace('\\', '/')
-				skip_ms_arg = 'true' if skip_octave_ms else 'false'
+				def run_octave_worker(part_idx):
+					with tempfile.NamedTemporaryFile(suffix=f'_image_part{part_idx}.csv', delete=False) as tmp:
+						part_csv = tmp.name
 
-				matlab_script = (
-					f"addpath('{matlab_dir.replace('\\', '/')}', '-begin'); "
-					f"run_eval_octave('{oct_pred}', '{oct_gt}', '{oct_out}', '{benchmark}', {part_idx}, {num_workers}, {skip_ms_arg}); "
-					f"exit;"
-				)
+					oct_pred = work_pred_dir.replace('\\', '/')
+					oct_gt = work_gt_dir.replace('\\', '/')
+					oct_out = part_csv.replace('\\', '/')
+					skip_ms_arg = 'true' if skip_octave_ms else 'false'
 
-				octave_cmd = [octave_bin, '--no-gui', '--silent', '--eval', matlab_script]
-				err_lines = []
-				try:
-					proc = subprocess.Popen(
-						octave_cmd,
-						stdout=subprocess.PIPE,
-						stderr=subprocess.STDOUT,
-						text=True,
-						bufsize=1
+					matlab_script = (
+						f"addpath('{matlab_dir.replace('\\', '/')}', '-begin'); "
+						f"run_eval_octave('{oct_pred}', '{oct_gt}', '{oct_out}', '{benchmark}', {part_idx}, {eff_workers}, {skip_ms_arg}, '{oct_pending}'); "
+						f"exit;"
 					)
-					for line in proc.stdout:
-						if 'PROGRESS_DONE:' in line:
-							with pbar_lock:
-								pbar_ldm.update(1)
-						else:
-							err_lines.append(line)
-					proc.wait()
-					if proc.returncode != 0:
-						print(f"❌ Error in Octave worker {part_idx} (exit code {proc.returncode}):")
-						for l in err_lines[-15:]:
-							print(f"   {l.strip()}")
+
+					octave_cmd = [octave_bin, '--no-gui', '--silent', '--eval', matlab_script]
+					err_lines = []
+					try:
+						proc = subprocess.Popen(
+							octave_cmd,
+							stdout=subprocess.PIPE,
+							stderr=subprocess.STDOUT,
+							text=True,
+							bufsize=1
+						)
+						for line in proc.stdout:
+							if line.startswith('PROGRESS_RESULT:'):
+								parts = line[len('PROGRESS_RESULT:'):].rstrip('\r\n').split('\t')
+								if len(parts) >= 5:
+									try:
+										p_nm, s_nm = parts[0].strip(), parts[1].strip()
+										ms_v, ld_v, tm_v = float(parts[2]), float(parts[3]), float(parts[4])
+										Ckpt2.append({
+											'Dewarped_Image': p_nm,
+											'Scan_GT': s_nm,
+											'MS_SSIM_M': round(ms_v, 6),
+											'LD_M': round(ld_v, 6),
+											'Time_seconds': round(tm_v, 3)
+										})
+										with pbar_lock:
+											pbar_ldm.update(1)
+											pbar_ldm.set_postfix({'LD-M': f"{ld_v:.2f}"})
+									except Exception:
+										pass
+							elif 'PROGRESS_DONE:' in line:
+								pass
+							else:
+								err_lines.append(line)
+						proc.wait()
+						if proc.returncode != 0:
+							print(f"❌ Error in Octave worker {part_idx} (exit code {proc.returncode}):")
+							for l in err_lines[-15:]:
+								print(f"   {l.strip()}")
+							if os.path.exists(part_csv):
+								try:
+									os.remove(part_csv)
+								except Exception:
+									pass
+							return pd.DataFrame()
 						if os.path.exists(part_csv):
 							try:
+								if os.path.getsize(part_csv) > 0:
+									df = pd.read_csv(part_csv)
+									df = df[df['Index'] != 'SUMMARY'].copy()
+									os.remove(part_csv)
+									return df
 								os.remove(part_csv)
-							except Exception:
-								pass
-						return pd.DataFrame()
-					if os.path.exists(part_csv):
-						try:
-							df = pd.read_csv(part_csv)
-							df = df[df['Index'] != 'SUMMARY'].copy()
-							os.remove(part_csv)
-							return df
-						except Exception as e:
-							print(f"❌ Error reading Octave worker {part_idx} CSV: {e}")
-				except Exception as e:
-					print(f"❌ Error in Octave worker {part_idx}: {e}")
-				return pd.DataFrame()
+							except Exception as e:
+								print(f"❌ Error reading Octave worker {part_idx} CSV: {e}")
+					except Exception as e:
+						print(f"❌ Error in Octave worker {part_idx}: {e}")
+					return pd.DataFrame()
 
-			if num_workers > 1:
-				with ThreadPoolExecutor(max_workers=num_workers) as executor:
-					part_dfs = list(executor.map(run_octave_worker, range(1, num_workers + 1)))
-				valid_dfs = [df for df in part_dfs if not df.empty]
-				if valid_dfs:
-					df_ldm = pd.concat(valid_dfs, ignore_index=True)
-					df_ldm = df_ldm.sort_values(by=['Dewarped_Image']).reset_index(drop=True)
-			else:
-				df_ldm = run_octave_worker(1)
+				if eff_workers > 1:
+					with ThreadPoolExecutor(max_workers=eff_workers) as executor:
+						part_dfs = list(executor.map(run_octave_worker, range(1, eff_workers + 1)))
+				else:
+					part_dfs = [run_octave_worker(1)]
 
-			pbar_ldm.close()
-			t_ldm_total = time.time() - t_ldm_start
+				for df_part in part_dfs:
+					if df_part is not None and not df_part.empty:
+						for _, row in df_part.iterrows():
+							k = (str(row['Dewarped_Image']).strip(), str(row['Scan_GT']).strip())
+							if k not in Ckpt2.Map and pd.notna(row.get('LD_M')):
+								Ckpt2.append({
+									'Dewarped_Image': k[0],
+									'Scan_GT': k[1],
+									'MS_SSIM_M': float(row['MS_SSIM_M']) if pd.notna(row.get('MS_SSIM_M')) else 0.0,
+									'LD_M': float(row['LD_M']),
+									'Time_seconds': float(row['Time_seconds']) if pd.notna(row.get('Time_seconds')) else 0.0
+								})
+			finally:
+				if pending_list_file and os.path.exists(pending_list_file):
+					try:
+						os.remove(pending_list_file)
+					except Exception:
+						pass
+				pbar_ldm.close()
+
+			df_ldm = Ckpt2.to_df(valid_pairs)
 			if df_ldm is not None and not df_ldm.empty:
+				t_ldm_total = time.time() - t_ldm_start
+				df_ldm['LD_M'] = pd.to_numeric(df_ldm['LD_M'], errors='coerce')
+				df_ldm['MS_SSIM_M'] = pd.to_numeric(df_ldm['MS_SSIM_M'], errors='coerce')
+				df_ldm['Time_seconds'] = pd.to_numeric(df_ldm['Time_seconds'], errors='coerce')
 				print(f'✅ LD-M Octave Complete! Mean: {df_ldm["LD_M"].mean():.2f} in {t_ldm_total:.2f}s')
+
+		if df_ldm is not None and not df_ldm.empty:
+			df_ldm['LD_M'] = pd.to_numeric(df_ldm['LD_M'], errors='coerce')
+			df_ldm['MS_SSIM_M'] = pd.to_numeric(df_ldm['MS_SSIM_M'], errors='coerce')
+			df_ldm['Time_seconds'] = pd.to_numeric(df_ldm['Time_seconds'], errors='coerce')
 
 	# 3. TEXT METRICS EVALUATION (TESSERACT 5.0)
 	if not skip_ocr:
-		step_name = '3/3' if ms_ssim_backend == 'torch' else '2/2'
+		step_name = '3/3' if (ms_ssim_backend == 'torch' and not skip_ldm) else ('1/1' if skip_image else '2/2')
 		print(f'\n>>> [Step {step_name}] Computing CER and Levenshtein ED using Tesseract 5.0...')
 		with tempfile.NamedTemporaryFile(suffix='_ocr_metrics.csv', delete=False) as tmp:
 			ocr_csv = tmp.name
 
+		step3_drv = os.path.join(ckpt_dir, 'step3_ocr.csv')
 		res_ocr = evaluate_ocr(
 			pred_dir=work_pred_dir,
 			gt_dir=work_gt_dir,
 			benchmark_name=benchmark,
 			output_csv=ocr_csv,
 			cache_json=ocr_cache_json,
-			num_workers=num_workers
+			num_workers=num_workers,
+			ckpt_csv=step3_drv,
+			resume=resume,
+			seed_df=seed_df
 		)
 		if isinstance(res_ocr, tuple) and len(res_ocr) == 2:
 			ocr_summary, df_ocr = res_ocr
@@ -529,7 +573,7 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_130'
 
 	if df_ms_ssim is not None and not df_ms_ssim.empty:
 		base_df = pd.merge(base_df, df_ms_ssim[['Dewarped_Image', 'Scan_GT', 'MS_SSIM_M', 'Time_ssim']], on=['Dewarped_Image', 'Scan_GT'], how='left')
-	elif df_ldm is not None and not df_ldm.empty and 'MS_SSIM_M' in df_ldm.columns:
+	elif df_ldm is not None and not df_ldm.empty and 'MS_SSIM_M' in df_ldm.columns and not skip_image:
 		base_df = pd.merge(base_df, df_ldm[['Dewarped_Image', 'Scan_GT', 'MS_SSIM_M']], on=['Dewarped_Image', 'Scan_GT'], how='left')
 
 	if df_ldm is not None and not df_ldm.empty:
@@ -544,7 +588,9 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_130'
 
 	for col in ['MS_SSIM_M', 'LD_M', 'CER', 'ED']:
 		if col in base_df.columns:
-			summary_dict[col] = round(pd.to_numeric(base_df[col], errors='coerce').mean(), 4 if col in ['MS_SSIM_M', 'CER'] else 2)
+			vals = pd.to_numeric(base_df[col], errors='coerce')
+			if not vals.isna().all():
+				summary_dict[col] = round(vals.mean(), 4 if col in ['MS_SSIM_M', 'CER'] else 2)
 
 	summary_df = pd.DataFrame([summary_dict])
 
@@ -570,7 +616,7 @@ def run_evaluation(pred_dir, gt_dir, model_name='Model', benchmark='docunet_130'
 def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
                         octave_bin='octave', ms_ssim_backend='torch',
                         num_workers=None, use_local_ssd=True,
-                        skip_image=False, skip_ocr=False, save_details=True,
+                        skip_image=False, skip_ldm=False, skip_ocr=False, save_details=True,
                         resume=True):
 	if num_workers is None or num_workers < 1:
 		num_workers = min(4, os.cpu_count() or 2)
@@ -591,7 +637,8 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 	print(f'Total Benchmarks : {len(target_bms)} ({", ".join(target_bms)})')
 	print(f'Base Directory   : {base_dir}')
 	print(f'Parallel Workers : {num_workers} workers')
-	print(f'Resume mode      : {resume}')
+	print(f'Resume mode      : {resume} (per-step & per-image checkpoints)')
+	print(f'Skip LD-M        : {skip_ldm}')
 	print('=' * 95)
 
 	suite_summaries = []
@@ -604,35 +651,29 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 
 		bm_sum_csv = os.path.join(report_dir, f'{model_name}_{bm}_summary.csv')
 		detail_csv = os.path.join(report_dir, f'{model_name}_{bm}_details.csv')
+		ckpt_dir = os.path.join(report_dir, '.checkpoints', model_name, bm)
+
+		need_ms = not skip_image
+		need_ldm = (not skip_image) and (not skip_ldm)
+		need_ocr = not skip_ocr
 
 		if resume and os.path.exists(bm_sum_csv):
-			try:
-				df_cached = pd.read_csv(bm_sum_csv)
-				if not df_cached.empty and 'Images' in df_cached.columns:
-					is_complete = True
-					if not skip_image:
-						if 'MS_SSIM_M' not in df_cached.columns or pd.isna(df_cached['MS_SSIM_M'].iloc[0]):
-							is_complete = False
-						if 'LD_M' not in df_cached.columns or pd.isna(df_cached['LD_M'].iloc[0]):
-							is_complete = False
-					if not skip_ocr and ('CER' not in df_cached.columns or pd.isna(df_cached['CER'].iloc[0])):
-						is_complete = False
+			df_cached = safe_read_csv(bm_sum_csv)
+			if df_cached is not None and not df_cached.empty and 'Images' in df_cached.columns:
+				is_complete = True
+				if need_ms and ('MS_SSIM_M' not in df_cached.columns or pd.isna(df_cached['MS_SSIM_M'].iloc[0])):
+					is_complete = False
+				if need_ldm and ('LD_M' not in df_cached.columns or pd.isna(df_cached['LD_M'].iloc[0])):
+					is_complete = False
+				if need_ocr and ('CER' not in df_cached.columns or pd.isna(df_cached['CER'].iloc[0])):
+					is_complete = False
 
-					if is_complete:
-						print(f'⚡ [RESUME] Đã tìm thấy báo cáo hoàn tất cho [{model_name.upper()}] trên [{bm.upper()}]. Bỏ qua đo lại.')
-						suite_summaries.append(df_cached)
-						continue
-					else:
-						print(f'🔄 [RESUME] Báo cáo trước đó của [{model_name.upper()}] trên [{bm.upper()}] bị thiếu chỉ số (LD-M hoặc OCR). Tiến hành đo lại...')
-			except OSError as e:
-				if is_endpoint_error(e):
-					remount_google_drive()
-					try:
-						df_cached = pd.read_csv(bm_sum_csv)
-					except Exception:
-						df_cached = None
-			except Exception:
-				pass
+				if is_complete:
+					print(f'⚡ [RESUME] Đã tìm thấy báo cáo hoàn tất cho [{model_name.upper()}] trên [{bm.upper()}]. Bỏ qua đo lại.')
+					suite_summaries.append(df_cached)
+					continue
+				else:
+					print(f'🔄 [RESUME] Báo cáo trước đó của [{model_name.upper()}] trên [{bm.upper()}] còn thiếu bước đo. Tiếp tục từ checkpoint...')
 
 		gt_dir = os.path.join(base_dir, 'benchmarks', bm, 'scan')
 		if not os.path.exists(gt_dir) and bm == 'docunet_130':
@@ -667,23 +708,23 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 			num_workers=num_workers,
 			use_local_ssd=use_local_ssd,
 			skip_image=skip_image,
+			skip_ldm=skip_ldm,
 			skip_ocr=skip_ocr,
-			save_details=save_details
+			save_details=save_details,
+			resume=resume,
+			checkpoint_dir=ckpt_dir,
+			seed_csv=detail_csv
 		)
 
 		if df_sum is not None and not df_sum.empty:
 			safe_to_csv(df_sum, bm_sum_csv, index=False, encoding='utf-8')
 			suite_summaries.append(df_sum)
 
-			# Incremental update of consolidated benchmark_summary.csv
 			all_summary_csv = os.path.join(report_dir, 'benchmark_summary.csv')
-			if os.path.exists(all_summary_csv):
-				try:
-					cur_master = pd.read_csv(all_summary_csv)
-					cur_master = cur_master[~((cur_master['Model'] == model_name) & (cur_master['Benchmark'] == bm))]
-					cur_master = pd.concat([cur_master, df_sum], ignore_index=True)
-				except Exception:
-					cur_master = df_sum
+			cur_master = safe_read_csv(all_summary_csv)
+			if cur_master is not None and not cur_master.empty:
+				cur_master = cur_master[~((cur_master['Model'] == model_name) & (cur_master['Benchmark'] == bm))]
+				cur_master = pd.concat([cur_master, df_sum], ignore_index=True)
 			else:
 				cur_master = df_sum
 			safe_to_csv(cur_master, all_summary_csv, index=False, encoding='utf-8')
@@ -693,20 +734,15 @@ def run_benchmark_suite(base_dir, model_name='DocTr', benchmarks=None,
 		report_dir = os.path.join(base_dir, 'eval_reports')
 		os.makedirs(report_dir, exist_ok=True)
 
-		# 1. Model summary CSV: <Model>_summary.csv
 		model_summary_csv = os.path.join(report_dir, f'{model_name}_summary.csv')
 		safe_to_csv(master_df, model_summary_csv, index=False, encoding='utf-8')
 
-		# 2. Consolidated benchmark_summary.csv across all models
 		all_summary_csv = os.path.join(report_dir, 'benchmark_summary.csv')
-		if os.path.exists(all_summary_csv):
-			try:
-				existing_df = pd.read_csv(all_summary_csv)
-				mask = (existing_df['Model'] == model_name) & (existing_df['Benchmark'].isin(master_df['Benchmark']))
-				existing_df = existing_df[~mask]
-				merged_df = pd.concat([existing_df, master_df], ignore_index=True)
-			except Exception:
-				merged_df = master_df
+		existing_df = safe_read_csv(all_summary_csv)
+		if existing_df is not None and not existing_df.empty:
+			mask = (existing_df['Model'] == model_name) & (existing_df['Benchmark'].isin(master_df['Benchmark']))
+			existing_df = existing_df[~mask]
+			merged_df = pd.concat([existing_df, master_df], ignore_index=True)
 		else:
 			merged_df = master_df
 		safe_to_csv(merged_df, all_summary_csv, index=False, encoding='utf-8')
@@ -738,7 +774,10 @@ if __name__ == '__main__':
 	parser.add_argument('--workers', type=int, default=2, help='Number of parallel workers')
 	parser.add_argument('--no_ssd_cache', action='store_true', help='Disable local SSD caching')
 	parser.add_argument('--skip_image', action='store_true', help='Skip image metrics (MS-SSIM-M & LD-M)')
+	parser.add_argument('--skip_ldm', action='store_true', help='Skip LD-M (Octave SIFT Flow) while keeping MS-SSIM-M and OCR')
 	parser.add_argument('--skip_ocr', action='store_true', help='Skip OCR metrics (CER & ED)')
+	parser.add_argument('--no_resume', action='store_true', help='Clear per-step/per-image checkpoints and re-evaluate from scratch')
+	parser.add_argument('--checkpoint_dir', type=str, default=None, help='Directory to store per-step/per-image checkpoints')
 	parser.add_argument('--save_details', action='store_true', help='Save per-image detailed metrics CSV (default: False)')
 	args = parser.parse_args()
 
@@ -752,8 +791,10 @@ if __name__ == '__main__':
 			num_workers=args.workers,
 			use_local_ssd=not args.no_ssd_cache,
 			skip_image=args.skip_image,
+			skip_ldm=args.skip_ldm,
 			skip_ocr=args.skip_ocr,
-			save_details=args.save_details
+			save_details=args.save_details,
+			resume=not args.no_resume
 		)
 	else:
 		if not args.pred_dir or not args.gt_dir:
@@ -770,6 +811,9 @@ if __name__ == '__main__':
 			num_workers=args.workers,
 			use_local_ssd=not args.no_ssd_cache,
 			skip_image=args.skip_image,
+			skip_ldm=args.skip_ldm,
 			skip_ocr=args.skip_ocr,
-			save_details=args.save_details
+			save_details=args.save_details,
+			resume=not args.no_resume,
+			checkpoint_dir=args.checkpoint_dir
 		)
